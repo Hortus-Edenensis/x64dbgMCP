@@ -981,9 +981,6 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
-                else {
-                    sendHttpResponse(clientSocket, 404, "text/plain", "Unknown endpoint");
-                }
                 // =============================================================================
                 // FLAG API ENDPOINTS
                 // =============================================================================
