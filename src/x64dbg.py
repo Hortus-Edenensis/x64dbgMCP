@@ -9,6 +9,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_X64DBG_SERVER = "http://127.0.0.1:8888/"
+DEFAULT_REQUEST_TIMEOUT_SEC = 30
 
 def _resolve_server_url_from_args_env() -> str:
     env_url = os.getenv("X64DBG_URL")
@@ -38,7 +39,7 @@ def safe_get(endpoint: str, params: dict = None):
     url = f"{x64dbg_server_url}{endpoint}"
 
     try:
-        response = requests.get(url, params=params, timeout=15)
+        response = requests.get(url, params=params, timeout=DEFAULT_REQUEST_TIMEOUT_SEC)
         response.encoding = 'utf-8'
         if response.ok:
             # Try to parse as JSON first
@@ -59,9 +60,9 @@ def safe_post(endpoint: str, data: dict | str):
     try:
         url = f"{x64dbg_server_url}{endpoint}"
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, timeout=DEFAULT_REQUEST_TIMEOUT_SEC)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), timeout=DEFAULT_REQUEST_TIMEOUT_SEC)
         
         response.encoding = 'utf-8'
         
@@ -509,7 +510,7 @@ def CmdlineSet(cmdline: str) -> str:
 # =============================================================================
 
 @mcp.tool()
-def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait_ms: int = 15000) -> dict:
+def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait_ms: int = 30000) -> dict:
     """
     Continue execution until execution returns to non-system (user) code.
 
