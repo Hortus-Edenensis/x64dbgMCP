@@ -44,7 +44,8 @@
 #include <cstring>
 #include <atomic>
 #include <functional>
-#include <chrono>
+#include <condition_variable>
+#include <queue>
 // Link with ws2_32.lib
 #pragma comment(lib, "ws2_32.lib")
 
@@ -76,7 +77,7 @@
 
 // Default settings
 #define DEFAULT_PORT 8888
-#define MAX_REQUEST_SIZE 8192
+#define MAX_REQUEST_SIZE 1048576
 
 // Global variables
 int g_pluginHandle;
@@ -85,7 +86,14 @@ bool g_httpServerRunning = false;
 int g_httpPort = DEFAULT_PORT;
 std::mutex g_httpMutex;
 SOCKET g_serverSocket = INVALID_SOCKET;
-std::timed_mutex g_requestMutex;
+std::mutex g_queueMutex;
+std::condition_variable g_queueCv;
+std::queue<SOCKET> g_socketQueue;
+std::vector<std::thread> g_workerThreads;
+std::mutex g_execCommandMutex;
+
+static const size_t MAX_QUEUE_SIZE = 64;
+static const int WORKER_COUNT = 4;
 
 // Run-until-user-code state
 std::atomic<bool> g_runUntilUserCodeActive(false);
@@ -195,7 +203,8 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
 bool startHttpServer();
 void stopHttpServer();
 DWORD WINAPI HttpServerThread(LPVOID lpParam);
-void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mutex> requestLock);
+void handleClientConnection(SOCKET clientSocket);
+void workerThreadLoop();
 std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge);
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
 void parseHttpRequest(const std::string& request, std::string& method, std::string& path, std::string& query, std::string& body);
@@ -302,6 +311,7 @@ void stopHttpServer() {
     
     if (g_httpServerRunning) {
         g_httpServerRunning = false;
+        g_queueCv.notify_all();
         
         // Close the server socket to unblock any accept calls
         if (g_serverSocket != INVALID_SOCKET) {
@@ -365,6 +375,13 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     u_long mode = 1;
     ioctlsocket(g_serverSocket, FIONBIO, &mode);
     
+    // Start worker threads
+    g_workerThreads.clear();
+    g_workerThreads.reserve(WORKER_COUNT);
+    for (int i = 0; i < WORKER_COUNT; ++i) {
+        g_workerThreads.emplace_back(workerThreadLoop);
+    }
+
     // Main server loop
     while (g_httpServerRunning) {
         // Accept a client connection
@@ -386,14 +403,16 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
             Sleep(100); // Avoid tight loop
             continue;
         }
-        std::unique_lock<std::timed_mutex> requestLock(g_requestMutex, std::defer_lock);
-        if (!requestLock.try_lock_for(std::chrono::milliseconds(100))) {
-            sendHttpResponse(clientSocket, 429, "text/plain", "Server busy");
-            closesocket(clientSocket);
-            continue;
+        {
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            if (g_socketQueue.size() >= MAX_QUEUE_SIZE) {
+                sendHttpResponse(clientSocket, 429, "text/plain", "Server busy");
+                closesocket(clientSocket);
+                continue;
+            }
+            g_socketQueue.push(clientSocket);
         }
-
-        std::thread(handleClientConnection, clientSocket, std::move(requestLock)).detach();
+        g_queueCv.notify_one();
     }
 
     // Clean up
@@ -402,13 +421,42 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         g_serverSocket = INVALID_SOCKET;
     }
 
+    g_queueCv.notify_all();
+    for (auto& t : g_workerThreads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    g_workerThreads.clear();
+
     WSACleanup();
     return 0;
 }
 
+void workerThreadLoop() {
+    while (g_httpServerRunning) {
+        SOCKET clientSocket = INVALID_SOCKET;
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            g_queueCv.wait(lock, [] {
+                return !g_httpServerRunning || !g_socketQueue.empty();
+            });
+            if (!g_httpServerRunning && g_socketQueue.empty()) {
+                return;
+            }
+            if (!g_socketQueue.empty()) {
+                clientSocket = g_socketQueue.front();
+                g_socketQueue.pop();
+            }
+        }
 
-void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mutex> requestLock) {
-    (void)requestLock;
+        if (clientSocket != INVALID_SOCKET) {
+            handleClientConnection(clientSocket);
+        }
+    }
+}
+
+void handleClientConnection(SOCKET clientSocket) {
     do {
         // Read the HTTP request
         bool tooLarge = false;
@@ -460,7 +508,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
                             submitted ? "Command queued" : "Failed to queue command");
                         continue;
                     }
-                    
+
                     // Generate unique log file path
                     char tempPath[MAX_PATH];
                     GetTempPathA(MAX_PATH, tempPath);
@@ -471,6 +519,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
                     }
                     std::string logFile = tempFile;
                     
+                    std::lock_guard<std::mutex> execLock(g_execCommandMutex);
                     // Clear the log first
                     GuiLogRedirect(logFile.c_str());
                     // Execute the command
