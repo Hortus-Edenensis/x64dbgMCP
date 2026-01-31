@@ -43,6 +43,7 @@
 #include <cstring>
 #include <atomic>
 #include <functional>
+#include <chrono>
 // Link with ws2_32.lib
 #pragma comment(lib, "ws2_32.lib")
 
@@ -83,11 +84,13 @@ bool g_httpServerRunning = false;
 int g_httpPort = DEFAULT_PORT;
 std::mutex g_httpMutex;
 SOCKET g_serverSocket = INVALID_SOCKET;
+std::timed_mutex g_requestMutex;
 
 // Run-until-user-code state
 std::atomic<bool> g_runUntilUserCodeActive(false);
 std::atomic<bool> g_runUntilUserCodeUserBpHit(false);
 std::atomic<bool> g_runUntilUserCodeOwnsBp(false);
+std::atomic<bool> g_runUntilUserCodeAutoResume(true);
 duint g_runUntilUserCodeBp = 0;
 std::atomic<bool> g_debugStepBusy(false);
 std::atomic<bool> g_stepBatchActive(false);
@@ -110,6 +113,7 @@ static void clearRunUntilUserCodeState() {
     g_runUntilUserCodeActive.store(false);
     g_runUntilUserCodeUserBpHit.store(false);
     g_runUntilUserCodeOwnsBp.store(false);
+    g_runUntilUserCodeAutoResume.store(true);
     g_runUntilUserCodeBp = 0;
 }
 
@@ -159,7 +163,7 @@ static bool startStepBatch(int count) {
     return true;
 }
 
-static bool startRunUntilUserCode(std::string& jsonOut) {
+static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
     duint entry = Script::Module::GetMainModuleEntry();
     if (!entry) {
         jsonOut = "Failed to resolve main module entry";
@@ -171,6 +175,7 @@ static bool startRunUntilUserCode(std::string& jsonOut) {
     g_runUntilUserCodeUserBpHit.store(false);
     g_runUntilUserCodeOwnsBp.store(bpSet);
     g_runUntilUserCodeActive.store(true);
+    g_runUntilUserCodeAutoResume.store(autoResume);
 
     bool submitted = DbgCmdExec("run");
 
@@ -189,7 +194,8 @@ static bool startRunUntilUserCode(std::string& jsonOut) {
 bool startHttpServer();
 void stopHttpServer();
 DWORD WINAPI HttpServerThread(LPVOID lpParam);
-std::string readHttpRequest(SOCKET clientSocket);
+void handleClientConnection(SOCKET clientSocket);
+std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge);
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
 void parseHttpRequest(const std::string& request, std::string& method, std::string& path, std::string& query, std::string& body);
 std::unordered_map<std::string, std::string> parseQueryParams(const std::string& query);
@@ -402,8 +408,29 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
             continue;
         }
         
+        std::thread(handleClientConnection, clientSocket).detach();
+    }
+
+    // Clean up
+    if (g_serverSocket != INVALID_SOCKET) {
+        closesocket(g_serverSocket);
+        g_serverSocket = INVALID_SOCKET;
+    }
+
+    WSACleanup();
+    return 0;
+}
+
+
+void handleClientConnection(SOCKET clientSocket) {
+    do {
         // Read the HTTP request
-        std::string requestData = readHttpRequest(clientSocket);
+        bool tooLarge = false;
+        std::string requestData = readHttpRequest(clientSocket, &tooLarge);
+        if (tooLarge) {
+            sendHttpResponse(clientSocket, 413, "text/plain", "Request too large");
+            break;
+        }
         
         if (!requestData.empty()) {
             // Parse the HTTP request
@@ -414,6 +441,12 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
             
             // Parse query parameters
             std::unordered_map<std::string, std::string> queryParams = parseQueryParams(query);
+
+            std::unique_lock<std::timed_mutex> requestLock(g_requestMutex, std::chrono::milliseconds(100));
+            if (!requestLock.owns_lock()) {
+                sendHttpResponse(clientSocket, 429, "text/plain", "Server busy");
+                break;
+            }
             
             // Handle different endpoints
             try {
@@ -444,7 +477,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
                     if (cmdLower == "runtousercode" || cmdLower == "runuser" || cmdLower == "runto user code") {
                         std::string jsonOut;
-                        bool ok = startRunUntilUserCode(jsonOut);
+                        bool ok = startRunUntilUserCode(jsonOut, true);
                         sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                         continue;
                     }
@@ -767,8 +800,16 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                         submitted ? "Debug run queued" : "Failed to queue debug run");
                 }
                 else if (path == "/Debug/RunUntilUserCode") {
+                    std::string autoStr = queryParams["autoResume"];
+                    bool autoResume = true;
+                    if (!autoStr.empty()) {
+                        std::string lower = autoStr;
+                        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                        autoResume = !(lower == "0" || lower == "false" || lower == "no" || lower == "off");
+                    }
+
                     std::string jsonOut;
-                    bool ok = startRunUntilUserCode(jsonOut);
+                    bool ok = startRunUntilUserCode(jsonOut, autoResume);
                     sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                 }
                 else if (path == "/Debug/CancelRunUntilUserCode") {
@@ -784,6 +825,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                         submitted ? "Debug restart queued" : "Failed to queue debug restart");
                 }
                 else if (path == "/Debug/Pause") {
+                    cancelRunUntilUserCodeIfActive();
                     bool submitted = DbgCmdExec("pause");
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug pause queued" : "Failed to queue debug pause");
@@ -794,18 +836,30 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                 }
                 else if (path == "/Debug/StepIn") {
                     cancelRunUntilUserCodeIfActive();
+                    if (DbgIsRunning()) {
+                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                        continue;
+                    }
                     bool queued = queueDebugStepCommand("sti");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step in queued" : "Step in busy");
                 }
                 else if (path == "/Debug/StepOver") {
                     cancelRunUntilUserCodeIfActive();
+                    if (DbgIsRunning()) {
+                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                        continue;
+                    }
                     bool queued = queueDebugStepCommand("sto");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step over queued" : "Step over busy");
                 }
                 else if (path == "/Debug/StepOverN") {
                     cancelRunUntilUserCodeIfActive();
+                    if (DbgIsRunning()) {
+                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                        continue;
+                    }
                     std::string countStr = queryParams["count"];
                     int count = 0;
                     if (!countStr.empty()) {
@@ -829,6 +883,10 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                 }
                 else if (path == "/Debug/StepOut") {
                     cancelRunUntilUserCodeIfActive();
+                    if (DbgIsRunning()) {
+                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                        continue;
+                    }
                     bool queued = queueDebugStepCommand("rto");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step out queued" : "Step out busy");
@@ -1391,22 +1449,14 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
             }
         }
         
-        // Close the client socket
-        closesocket(clientSocket);
-    }
+    } while(false);
 
-    // Clean up
-    if (g_serverSocket != INVALID_SOCKET) {
-        closesocket(g_serverSocket);
-        g_serverSocket = INVALID_SOCKET;
-    }
-
-    WSACleanup();
-    return 0;
+    // Close the client socket
+    closesocket(clientSocket);
 }
 
 // Function to read the HTTP request
-std::string readHttpRequest(SOCKET clientSocket) {
+std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge) {
     std::string request;
     char buffer[1024];
     int bytesReceived;
@@ -1422,6 +1472,10 @@ std::string readHttpRequest(SOCKET clientSocket) {
     bool headersDone = false;
     size_t contentLength = 0;
     size_t headerEndPos = std::string::npos;
+
+    if (tooLarge) {
+        *tooLarge = false;
+    }
 
     while (request.size() < MAX_REQUEST_SIZE) {
         bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
@@ -1454,6 +1508,12 @@ std::string readHttpRequest(SOCKET clientSocket) {
                     } catch (...) {
                         contentLength = 0;
                     }
+                    if (contentLength > MAX_REQUEST_SIZE) {
+                        if (tooLarge) {
+                            *tooLarge = true;
+                        }
+                        return "";
+                    }
                 }
             }
         }
@@ -1467,6 +1527,13 @@ std::string readHttpRequest(SOCKET clientSocket) {
                 break;
             }
         }
+    }
+
+    if (request.size() >= MAX_REQUEST_SIZE) {
+        if (tooLarge) {
+            *tooLarge = true;
+        }
+        return "";
     }
     
     return request;
@@ -1523,6 +1590,9 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
     std::string statusText;
     switch (statusCode) {
         case 200: statusText = "OK"; break;
+        case 409: statusText = "Conflict"; break;
+        case 413: statusText = "Payload Too Large"; break;
+        case 429: statusText = "Too Many Requests"; break;
         case 404: statusText = "Not Found"; break;
         case 500: statusText = "Internal Server Error"; break;
         default: statusText = "Unknown";
@@ -1687,6 +1757,11 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
     }
 
     if (!g_runUntilUserCodeActive.load()) {
+        return;
+    }
+
+    if (!g_runUntilUserCodeAutoResume.load()) {
+        clearRunUntilUserCodeState();
         return;
     }
 

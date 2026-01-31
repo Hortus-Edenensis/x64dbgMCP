@@ -534,7 +534,7 @@ def CmdlineSet(cmdline: str) -> str:
 # =============================================================================
 
 @mcp.tool()
-def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait_ms: int = 30000) -> dict:
+def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait_ms: int = 30000, auto_resume: bool = True) -> dict:
     """
     Continue execution until execution returns to non-system (user) code.
 
@@ -549,7 +549,7 @@ def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait
     if not IsDebugging():
         return {"error": "Not debugging"}
 
-    native = safe_get("Debug/RunUntilUserCode")
+    native = safe_get("Debug/RunUntilUserCode", {"autoResume": "1" if auto_resume else "0"})
     if isinstance(native, dict) and native.get("entry"):
         return {"status": "queued", **native}
     if isinstance(native, str) and "Unknown endpoint" not in native and "404" not in native:
