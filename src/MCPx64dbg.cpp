@@ -41,6 +41,7 @@
 #include <fstream>
 #include <cctype>
 #include <cstring>
+#include <atomic>
 // Link with ws2_32.lib
 #pragma comment(lib, "ws2_32.lib")
 
@@ -82,6 +83,32 @@ int g_httpPort = DEFAULT_PORT;
 std::mutex g_httpMutex;
 SOCKET g_serverSocket = INVALID_SOCKET;
 
+// Run-until-user-code state
+std::atomic<bool> g_runUntilUserCodeActive(false);
+std::atomic<bool> g_runUntilUserCodeUserBpHit(false);
+std::atomic<bool> g_runUntilUserCodeOwnsBp(false);
+duint g_runUntilUserCodeBp = 0;
+
+// Helpers
+static bool isSystemModuleAddr(duint addr) {
+    const DBGFUNCTIONS* dbg = DbgFunctions();
+    if (!dbg || !dbg->ModBaseFromAddr || !dbg->ModGetParty) {
+        return true;
+    }
+    duint base = dbg->ModBaseFromAddr(addr);
+    if (!base) {
+        return true;
+    }
+    return dbg->ModGetParty(base) == mod_system;
+}
+
+static void clearRunUntilUserCodeState() {
+    g_runUntilUserCodeActive.store(false);
+    g_runUntilUserCodeUserBpHit.store(false);
+    g_runUntilUserCodeOwnsBp.store(false);
+    g_runUntilUserCodeBp = 0;
+}
+
 // Forward declarations
 bool startHttpServer();
 void stopHttpServer();
@@ -96,6 +123,12 @@ std::string urlDecode(const std::string& str);
 bool cbEnableHttpServer(int argc, char* argv[]);
 bool cbSetHttpPort(int argc, char* argv[]);
 void registerCommands();
+
+// Debug callbacks
+void cbSystemBreakpoint(CBTYPE cbType, void* callbackInfo);
+void cbBreakpoint(CBTYPE cbType, void* callbackInfo);
+void cbPauseDebug(CBTYPE cbType, void* callbackInfo);
+void cbStopDebug(CBTYPE cbType, void* callbackInfo);
 
 //=============================================================================
 // Plugin Interface Implementation
@@ -113,6 +146,12 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     
     // Register commands
     registerCommands();
+
+    // Register callbacks for run-until-user-code behavior
+    _plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, cbSystemBreakpoint);
+    _plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, cbBreakpoint);
+    _plugin_registercallback(g_pluginHandle, CB_PAUSEDEBUG, cbPauseDebug);
+    _plugin_registercallback(g_pluginHandle, CB_STOPDEBUG, cbStopDebug);
 
     // Start the HTTP server
     if (startHttpServer()) {
@@ -620,6 +659,37 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     bool submitted = DbgCmdExec("run");
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug run queued" : "Failed to queue debug run");
+                }
+                else if (path == "/Debug/RunUntilUserCode") {
+                    duint entry = Script::Module::GetMainModuleEntry();
+                    if (!entry) {
+                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to resolve main module entry");
+                        continue;
+                    }
+
+                    bool bpSet = Script::Debug::SetBreakpoint(entry);
+                    g_runUntilUserCodeBp = entry;
+                    g_runUntilUserCodeUserBpHit.store(false);
+                    g_runUntilUserCodeOwnsBp.store(bpSet);
+                    g_runUntilUserCodeActive.store(true);
+
+                    bool submitted = DbgCmdExec("run");
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"entry\":\"0x" << std::hex << entry << "\",";
+                    ss << "\"breakpoint_set\":" << (bpSet ? "true" : "false") << ",";
+                    ss << "\"run_queued\":" << (submitted ? "true" : "false");
+                    ss << "}";
+
+                    sendHttpResponse(clientSocket, submitted ? 200 : 500, "application/json", ss.str());
+                }
+                else if (path == "/Debug/CancelRunUntilUserCode") {
+                    if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
+                        Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
+                    }
+                    clearRunUntilUserCodeState();
+                    sendHttpResponse(clientSocket, 200, "text/plain", "Run-until-user-code canceled");
                 }
                 else if (path == "/Debug/Restart") {
                     bool submitted = DbgCmdExec("restart");
@@ -1398,4 +1468,71 @@ void registerCommands() {
                            "Toggle HTTP server on/off");
     _plugin_registercommand(g_pluginHandle, "httpport", cbSetHttpPort, 
                            "Set HTTP server port");
+}
+
+// =============================================================================
+// Debug callbacks
+// =============================================================================
+
+void cbSystemBreakpoint(CBTYPE cbType, void* callbackInfo) {
+    (void)cbType;
+    (void)callbackInfo;
+
+    if (g_runUntilUserCodeActive.load()) {
+        DbgCmdExec("run");
+    }
+}
+
+void cbBreakpoint(CBTYPE cbType, void* callbackInfo) {
+    (void)cbType;
+    if (!callbackInfo) {
+        return;
+    }
+
+    if (!g_runUntilUserCodeActive.load()) {
+        return;
+    }
+
+    PLUG_CB_BREAKPOINT* info = (PLUG_CB_BREAKPOINT*)callbackInfo;
+    if (!info->breakpoint) {
+        return;
+    }
+
+    duint addr = info->breakpoint->addr;
+    if (g_runUntilUserCodeBp && addr == g_runUntilUserCodeBp) {
+        if (g_runUntilUserCodeOwnsBp.load()) {
+            Script::Debug::DeleteBreakpoint(addr);
+        }
+        clearRunUntilUserCodeState();
+        return;
+    }
+
+    g_runUntilUserCodeUserBpHit.store(true);
+}
+
+void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
+    (void)cbType;
+    (void)callbackInfo;
+
+    if (!g_runUntilUserCodeActive.load()) {
+        return;
+    }
+
+    if (g_runUntilUserCodeUserBpHit.load()) {
+        return;
+    }
+
+    duint rip = Script::Register::Get(REG_IP);
+    if (isSystemModuleAddr(rip)) {
+        DbgCmdExec("run");
+        return;
+    }
+
+    clearRunUntilUserCodeState();
+}
+
+void cbStopDebug(CBTYPE cbType, void* callbackInfo) {
+    (void)cbType;
+    (void)callbackInfo;
+    clearRunUntilUserCodeState();
 }

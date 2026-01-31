@@ -524,6 +524,12 @@ def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait
     if not IsDebugging():
         return {"error": "Not debugging"}
 
+    native = safe_get("Debug/RunUntilUserCode")
+    if isinstance(native, dict) and native.get("entry"):
+        return {"status": "queued", **native}
+    if isinstance(native, str) and "Unknown endpoint" not in native and "404" not in native:
+        return {"error": native}
+
     system_root = os.getenv("SystemRoot") or os.getenv("WINDIR") or "C:\\Windows"
     last_info: Dict[str, Any] = {}
 
@@ -576,6 +582,16 @@ def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait
             }
 
     return {"error": "Max cycles reached without user code", "last": last_info}
+
+@mcp.tool()
+def CancelRunUntilUserCode() -> str:
+    """
+    Cancel an in-progress run-until-user-code operation
+
+    Returns:
+        Status message
+    """
+    return safe_get("Debug/CancelRunUntilUserCode")
 
 # =============================================================================
 # ASSEMBLER API
