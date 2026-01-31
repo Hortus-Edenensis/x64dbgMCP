@@ -444,6 +444,29 @@ def DebugStepOver() -> str:
     return safe_get("Debug/StepOver")
 
 @mcp.tool()
+def DebugStepOverN(count: int) -> str:
+    """
+    Step over multiple instructions using the debugger command queue
+
+    Parameters:
+        count: Number of step-over iterations
+
+    Returns:
+        Status message
+    """
+    return safe_get("Debug/StepOverN", {"count": str(count)})
+
+@mcp.tool()
+def CancelStepBatch() -> str:
+    """
+    Cancel an in-progress step-over batch
+
+    Returns:
+        Status message
+    """
+    return safe_get("Debug/CancelStepBatch")
+
+@mcp.tool()
 def DebugStepOut() -> str:
     """
     Step out of the current function using Script API

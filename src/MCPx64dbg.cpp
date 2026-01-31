@@ -90,6 +90,8 @@ std::atomic<bool> g_runUntilUserCodeUserBpHit(false);
 std::atomic<bool> g_runUntilUserCodeOwnsBp(false);
 duint g_runUntilUserCodeBp = 0;
 std::atomic<bool> g_debugStepBusy(false);
+std::atomic<bool> g_stepBatchActive(false);
+std::atomic<int> g_stepBatchRemaining(0);
 
 // Helpers
 static bool isSystemModuleAddr(duint addr) {
@@ -130,6 +132,56 @@ static bool queueDebugStepCommand(const char* cmd) {
     if (!submitted) {
         g_debugStepBusy.store(false);
     }
+    return submitted;
+}
+
+static void stopStepBatch() {
+    g_stepBatchActive.store(false);
+    g_stepBatchRemaining.store(0);
+    g_debugStepBusy.store(false);
+}
+
+static bool startStepBatch(int count) {
+    if (count <= 0) {
+        return false;
+    }
+    bool expected = false;
+    if (!g_debugStepBusy.compare_exchange_strong(expected, true)) {
+        return false;
+    }
+    g_stepBatchRemaining.store(count);
+    g_stepBatchActive.store(true);
+    bool submitted = DbgCmdExec("sto");
+    if (!submitted) {
+        stopStepBatch();
+        return false;
+    }
+    return true;
+}
+
+static bool startRunUntilUserCode(std::string& jsonOut) {
+    duint entry = Script::Module::GetMainModuleEntry();
+    if (!entry) {
+        jsonOut = "Failed to resolve main module entry";
+        return false;
+    }
+
+    bool bpSet = Script::Debug::SetBreakpoint(entry);
+    g_runUntilUserCodeBp = entry;
+    g_runUntilUserCodeUserBpHit.store(false);
+    g_runUntilUserCodeOwnsBp.store(bpSet);
+    g_runUntilUserCodeActive.store(true);
+
+    bool submitted = DbgCmdExec("run");
+
+    std::stringstream ss;
+    ss << "{";
+    ss << "\"entry\":\"0x" << std::hex << entry << "\",";
+    ss << "\"breakpoint_set\":" << (bpSet ? "true" : "false") << ",";
+    ss << "\"run_queued\":" << (submitted ? "true" : "false");
+    ss << "}";
+
+    jsonOut = ss.str();
     return submitted;
 }
 
@@ -385,6 +437,15 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     
                     if (cmd.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing command parameter");
+                        continue;
+                    }
+
+                    std::string cmdLower = cmd;
+                    std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
+                    if (cmdLower == "runtousercode" || cmdLower == "runuser" || cmdLower == "runto user code") {
+                        std::string jsonOut;
+                        bool ok = startRunUntilUserCode(jsonOut);
+                        sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                         continue;
                     }
 
@@ -706,28 +767,9 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                         submitted ? "Debug run queued" : "Failed to queue debug run");
                 }
                 else if (path == "/Debug/RunUntilUserCode") {
-                    duint entry = Script::Module::GetMainModuleEntry();
-                    if (!entry) {
-                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to resolve main module entry");
-                        continue;
-                    }
-
-                    bool bpSet = Script::Debug::SetBreakpoint(entry);
-                    g_runUntilUserCodeBp = entry;
-                    g_runUntilUserCodeUserBpHit.store(false);
-                    g_runUntilUserCodeOwnsBp.store(bpSet);
-                    g_runUntilUserCodeActive.store(true);
-
-                    bool submitted = DbgCmdExec("run");
-
-                    std::stringstream ss;
-                    ss << "{";
-                    ss << "\"entry\":\"0x" << std::hex << entry << "\",";
-                    ss << "\"breakpoint_set\":" << (bpSet ? "true" : "false") << ",";
-                    ss << "\"run_queued\":" << (submitted ? "true" : "false");
-                    ss << "}";
-
-                    sendHttpResponse(clientSocket, submitted ? 200 : 500, "application/json", ss.str());
+                    std::string jsonOut;
+                    bool ok = startRunUntilUserCode(jsonOut);
+                    sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                 }
                 else if (path == "/Debug/CancelRunUntilUserCode") {
                     if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
@@ -742,8 +784,9 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                         submitted ? "Debug restart queued" : "Failed to queue debug restart");
                 }
                 else if (path == "/Debug/Pause") {
-                    Script::Debug::Pause();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Debug pause executed");
+                    bool submitted = DbgCmdExec("pause");
+                    sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
+                        submitted ? "Debug pause queued" : "Failed to queue debug pause");
                 }
                 else if (path == "/Debug/Stop") {
                     Script::Debug::Stop();
@@ -760,6 +803,29 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     bool queued = queueDebugStepCommand("sto");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step over queued" : "Step over busy");
+                }
+                else if (path == "/Debug/StepOverN") {
+                    cancelRunUntilUserCodeIfActive();
+                    std::string countStr = queryParams["count"];
+                    int count = 0;
+                    if (!countStr.empty()) {
+                        try {
+                            count = std::stoi(countStr);
+                        } catch (...) {
+                            count = 0;
+                        }
+                    }
+                    if (count <= 0) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid count");
+                        continue;
+                    }
+                    bool started = startStepBatch(count);
+                    sendHttpResponse(clientSocket, started ? 200 : 409, "text/plain",
+                        started ? "Step over batch queued" : "Step over busy");
+                }
+                else if (path == "/Debug/CancelStepBatch") {
+                    stopStepBatch();
+                    sendHttpResponse(clientSocket, 200, "text/plain", "Step batch canceled");
                 }
                 else if (path == "/Debug/StepOut") {
                     cancelRunUntilUserCodeIfActive();
@@ -1586,6 +1652,10 @@ void cbBreakpoint(CBTYPE cbType, void* callbackInfo) {
         return;
     }
 
+    if (g_stepBatchActive.load()) {
+        stopStepBatch();
+    }
+
     if (!g_runUntilUserCodeActive.load()) {
         return;
     }
@@ -1612,6 +1682,9 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
     (void)callbackInfo;
 
     g_debugStepBusy.store(false);
+    if (g_stepBatchActive.load()) {
+        stopStepBatch();
+    }
 
     if (!g_runUntilUserCodeActive.load()) {
         return;
@@ -1634,11 +1707,30 @@ void cbStopDebug(CBTYPE cbType, void* callbackInfo) {
     (void)cbType;
     (void)callbackInfo;
     g_debugStepBusy.store(false);
+    stopStepBatch();
     clearRunUntilUserCodeState();
 }
 
 void cbStepped(CBTYPE cbType, void* callbackInfo) {
     (void)cbType;
     (void)callbackInfo;
+    if (g_stepBatchActive.load()) {
+        int remaining = g_stepBatchRemaining.load();
+        if (remaining > 0) {
+            remaining -= 1;
+            g_stepBatchRemaining.store(remaining);
+        }
+
+        if (remaining > 0) {
+            bool submitted = DbgCmdExec("sto");
+            if (!submitted) {
+                stopStepBatch();
+            }
+            return;
+        }
+        stopStepBatch();
+        return;
+    }
+
     g_debugStepBusy.store(false);
 }
