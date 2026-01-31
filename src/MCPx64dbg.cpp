@@ -22,6 +22,7 @@
 #include "pluginsdk/_scriptapi_flag.h"
 #include "pluginsdk/_scriptapi_gui.h"
 #include "pluginsdk/_scriptapi_misc.h"
+#include "pluginsdk/_dbgfunctions.h"
 #include <iomanip>  // For std::setw and std::setfill
 
 // Socket includes - after Windows.h
@@ -39,6 +40,7 @@
 #include <memory>
 #include <fstream>
 #include <cctype>
+#include <cstring>
 // Link with ws2_32.lib
 #pragma comment(lib, "ws2_32.lib")
 
@@ -615,8 +617,14 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                 // DEBUG API ENDPOINTS
                 // =============================================================================
                 else if (path == "/Debug/Run") {
-                    Script::Debug::Run();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Debug run executed");
+                    bool submitted = DbgCmdExec("run");
+                    sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
+                        submitted ? "Debug run queued" : "Failed to queue debug run");
+                }
+                else if (path == "/Debug/Restart") {
+                    bool submitted = DbgCmdExec("restart");
+                    sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
+                        submitted ? "Debug restart queued" : "Failed to queue debug restart");
                 }
                 else if (path == "/Debug/Pause") {
                     Script::Debug::Pause();
@@ -683,6 +691,51 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     bool success = Script::Debug::DeleteBreakpoint(addr);
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Breakpoint deleted successfully" : "Failed to delete breakpoint");
+                }
+                else if (path == "/Cmdline/Get") {
+                    const DBGFUNCTIONS* dbg = DbgFunctions();
+                    if (!dbg || !dbg->GetCmdline) {
+                        sendHttpResponse(clientSocket, 500, "text/plain", "GetCmdline not available");
+                        continue;
+                    }
+
+                    size_t size = 0;
+                    bool ok = dbg->GetCmdline(nullptr, &size);
+                    if (!ok || size == 0) {
+                        size = 4096;
+                    }
+
+                    std::string buffer(size, '\0');
+                    if (!dbg->GetCmdline(buffer.data(), &size)) {
+                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to get cmdline");
+                        continue;
+                    }
+
+                    std::string cmdline = std::string(buffer.c_str());
+                    sendHttpResponse(clientSocket, 200, "text/plain", cmdline);
+                }
+                else if (path == "/Cmdline/Set") {
+                    const DBGFUNCTIONS* dbg = DbgFunctions();
+                    if (!dbg || !dbg->SetCmdline) {
+                        sendHttpResponse(clientSocket, 500, "text/plain", "SetCmdline not available");
+                        continue;
+                    }
+
+                    std::string cmdline = queryParams["cmdline"];
+                    if (cmdline.empty() && !body.empty()) {
+                        cmdline = body;
+                    } else {
+                        cmdline = urlDecode(cmdline);
+                    }
+
+                    if (cmdline.empty()) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Missing cmdline parameter");
+                        continue;
+                    }
+
+                    bool success = dbg->SetCmdline(cmdline.c_str());
+                    sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain",
+                        success ? "Cmdline set successfully" : "Failed to set cmdline");
                 }
                 
                 else if (path == "/Assembler/Assemble") {

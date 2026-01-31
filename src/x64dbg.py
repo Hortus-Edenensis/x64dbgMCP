@@ -2,6 +2,7 @@ import sys
 import os
 import inspect
 import json
+import time
 from typing import Any, Dict, List, Callable
 import requests
 
@@ -74,6 +75,55 @@ def safe_post(endpoint: str, data: dict | str):
             return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
         return f"Request failed: {str(e)}"
+
+def _normalize_windows_path(path: str) -> str:
+    if not path:
+        return ""
+    return path.replace("/", "\\").lower()
+
+def _is_system_module(module_name: str | None, module_path: str | None, system_root: str) -> bool:
+    name = (module_name or "").lower()
+    path = _normalize_windows_path(module_path or "")
+    root = _normalize_windows_path(system_root)
+
+    if not name and not path:
+        return True
+
+    if path and root and path.startswith(root):
+        return True
+    if "\\windows\\" in path:
+        return True
+
+    if name:
+        system_names = {
+            "ntdll.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "user32.dll",
+            "gdi32.dll",
+            "gdi32full.dll",
+            "win32u.dll",
+            "advapi32.dll",
+            "ucrtbase.dll",
+            "msvcrt.dll",
+            "msvcp140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "combase.dll",
+            "ole32.dll",
+            "oleaut32.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "shlwapi.dll",
+            "shcore.dll",
+            "imm32.dll",
+            "ws2_32.dll",
+            "inputhost.dll",
+        }
+        if name in system_names:
+            return True
+
+    return False
 
 # =============================================================================
 # TOOL REGISTRY INTROSPECTION (for CLI/Claude tool-use)
@@ -342,6 +392,16 @@ def DebugRun() -> str:
     return safe_get("Debug/Run")
 
 @mcp.tool()
+def DebugRestart() -> str:
+    """
+    Restart the debugged process using the debugger command queue
+
+    Returns:
+        Status message
+    """
+    return safe_get("Debug/Restart")
+
+@mcp.tool()
 def DebugPause() -> str:
     """
     Pause execution of the debugged process using Script API
@@ -416,6 +476,106 @@ def DebugDeleteBreakpoint(addr: str) -> str:
         Status message
     """
     return safe_get("Debug/DeleteBreakpoint", {"addr": addr})
+
+# =============================================================================
+# CMDLINE API
+# =============================================================================
+
+@mcp.tool()
+def CmdlineGet() -> str:
+    """
+    Get the current debuggee command line
+
+    Returns:
+        Command line string
+    """
+    return safe_get("Cmdline/Get")
+
+@mcp.tool()
+def CmdlineSet(cmdline: str) -> str:
+    """
+    Set the debuggee command line
+
+    Parameters:
+        cmdline: Full command line string
+
+    Returns:
+        Status message
+    """
+    return safe_post("Cmdline/Set", cmdline)
+
+# =============================================================================
+# WORKFLOW HELPERS
+# =============================================================================
+
+@mcp.tool()
+def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait_ms: int = 15000) -> dict:
+    """
+    Continue execution until execution returns to non-system (user) code.
+
+    Parameters:
+        max_cycles: Maximum run/pause cycles to attempt
+        poll_interval_ms: Poll interval while waiting for a pause
+        max_wait_ms: Max time to wait per run before giving up
+
+    Returns:
+        Dict with RIP/module info or error
+    """
+    if not IsDebugging():
+        return {"error": "Not debugging"}
+
+    system_root = os.getenv("SystemRoot") or os.getenv("WINDIR") or "C:\\Windows"
+    last_info: Dict[str, Any] = {}
+
+    for cycle in range(1, max_cycles + 1):
+        run_result = DebugRun()
+        if isinstance(run_result, str) and run_result.lower().startswith("error"):
+            return {"error": run_result}
+
+        deadline = time.time() + (max_wait_ms / 1000.0)
+        while time.time() < deadline:
+            if not IsDebugActive():
+                break
+            time.sleep(max(poll_interval_ms, 10) / 1000.0)
+        else:
+            return {"error": "Timed out waiting for break", "cycle": cycle, "last": last_info}
+
+        rip = RegisterGet("RIP")
+        if not isinstance(rip, str) or not rip.startswith("0x"):
+            return {"error": "Failed to read RIP", "cycle": cycle, "last": last_info}
+
+        base_info = MemoryBase(rip)
+        base_addr = ""
+        if isinstance(base_info, dict):
+            base_addr = base_info.get("base_address", "")
+
+        module_name = ""
+        module_path = ""
+        modules = GetModuleList()
+        if isinstance(modules, list) and base_addr:
+            for m in modules:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("base", "").lower() == base_addr.lower():
+                    module_name = m.get("name", "")
+                    module_path = m.get("path", "")
+                    break
+
+        last_info = {
+            "rip": rip,
+            "base": base_addr,
+            "module": module_name,
+            "path": module_path,
+        }
+
+        if not _is_system_module(module_name, module_path, system_root):
+            return {
+                "status": "user_code",
+                "cycle": cycle,
+                **last_info,
+            }
+
+    return {"error": "Max cycles reached without user code", "last": last_info}
 
 # =============================================================================
 # ASSEMBLER API
