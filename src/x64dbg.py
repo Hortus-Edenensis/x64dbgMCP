@@ -231,17 +231,18 @@ def _block_to_dict(block: Any) -> Dict[str, Any]:
 # =============================================================================
 
 @mcp.tool()
-def ExecCommand(cmd: str) -> str:
+def ExecCommand(cmd: str, wait: bool = False) -> str:
     """
     Execute a command in x64dbg and return its output
     
     Parameters:
         cmd: Command to execute
+        wait: Wait for command completion and capture output
     
     Returns:
         Command execution status and output
     """
-    return safe_get("ExecCommand", {"cmd": cmd})
+    return safe_get("ExecCommand", {"cmd": cmd, "wait": "1" if wait else "0"})
 
 # =============================================================================
 # DEBUGGING STATUS

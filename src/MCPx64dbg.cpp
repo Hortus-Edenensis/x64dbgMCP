@@ -121,20 +121,16 @@ static void cancelRunUntilUserCodeIfActive() {
     clearRunUntilUserCodeState();
 }
 
-static bool queueDebugStep(const std::function<void()>& fn) {
+static bool queueDebugStepCommand(const char* cmd) {
     bool expected = false;
     if (!g_debugStepBusy.compare_exchange_strong(expected, true)) {
         return false;
     }
-    std::thread([fn]() {
-        try {
-            fn();
-        } catch (...) {
-            // Best-effort: keep server responsive even if debug step throws.
-        }
+    bool submitted = DbgCmdExec(cmd);
+    if (!submitted) {
         g_debugStepBusy.store(false);
-    }).detach();
-    return true;
+    }
+    return submitted;
 }
 
 // Forward declarations
@@ -157,6 +153,7 @@ void cbSystemBreakpoint(CBTYPE cbType, void* callbackInfo);
 void cbBreakpoint(CBTYPE cbType, void* callbackInfo);
 void cbPauseDebug(CBTYPE cbType, void* callbackInfo);
 void cbStopDebug(CBTYPE cbType, void* callbackInfo);
+void cbStepped(CBTYPE cbType, void* callbackInfo);
 
 //=============================================================================
 // Plugin Interface Implementation
@@ -180,6 +177,7 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     _plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, cbBreakpoint);
     _plugin_registercallback(g_pluginHandle, CB_PAUSEDEBUG, cbPauseDebug);
     _plugin_registercallback(g_pluginHandle, CB_STOPDEBUG, cbStopDebug);
+    _plugin_registercallback(g_pluginHandle, CB_STEPPED, cbStepped);
 
     // Start the HTTP server
     if (startHttpServer()) {
@@ -376,17 +374,36 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                      else {
                         cmd = urlDecode(cmd);  
                     }
+
+                    std::string waitStr = queryParams["wait"];
+                    bool wait = false;
+                    if (!waitStr.empty()) {
+                        std::string lower = waitStr;
+                        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                        wait = (lower == "1" || lower == "true" || lower == "yes" || lower == "on");
+                    }
                     
                     if (cmd.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing command parameter");
+                        continue;
+                    }
+
+                    if (!wait) {
+                        bool submitted = DbgCmdExec(cmd.c_str());
+                        sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
+                            submitted ? "Command queued" : "Failed to queue command");
                         continue;
                     }
                     
                     // Generate unique log file path
                     char tempPath[MAX_PATH];
                     GetTempPathA(MAX_PATH, tempPath);
-                    std::string logFile = std::string(tempPath) + "x64dbg_cmd_" + 
-                        std::to_string(GetTickCount64()) + ".log";
+                    char tempFile[MAX_PATH];
+                    if (!GetTempFileNameA(tempPath, "xdbg", 0, tempFile)) {
+                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to create temp file");
+                        continue;
+                    }
+                    std::string logFile = tempFile;
                     
                     // Clear the log first
                     GuiLogRedirect(logFile.c_str());
@@ -734,19 +751,19 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                 }
                 else if (path == "/Debug/StepIn") {
                     cancelRunUntilUserCodeIfActive();
-                    bool queued = queueDebugStep([]() { Script::Debug::StepIn(); });
+                    bool queued = queueDebugStepCommand("sti");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step in queued" : "Step in busy");
                 }
                 else if (path == "/Debug/StepOver") {
                     cancelRunUntilUserCodeIfActive();
-                    bool queued = queueDebugStep([]() { Script::Debug::StepOver(); });
+                    bool queued = queueDebugStepCommand("sto");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step over queued" : "Step over busy");
                 }
                 else if (path == "/Debug/StepOut") {
                     cancelRunUntilUserCodeIfActive();
-                    bool queued = queueDebugStep([]() { Script::Debug::StepOut(); });
+                    bool queued = queueDebugStepCommand("rto");
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step out queued" : "Step out busy");
                 }
@@ -1325,19 +1342,65 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
 // Function to read the HTTP request
 std::string readHttpRequest(SOCKET clientSocket) {
     std::string request;
-    char buffer[MAX_REQUEST_SIZE];
+    char buffer[1024];
     int bytesReceived;
     
     // Set socket to blocking mode to receive full request
     u_long mode = 0;
     ioctlsocket(clientSocket, FIONBIO, &mode);
+
+    // Set a receive timeout to avoid hanging the server
+    int timeoutMs = 5000;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
     
-    // Receive data
-    bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-    
-    if (bytesReceived > 0) {
-        buffer[bytesReceived] = '\0';
-        request = buffer;
+    bool headersDone = false;
+    size_t contentLength = 0;
+    size_t headerEndPos = std::string::npos;
+
+    while (request.size() < MAX_REQUEST_SIZE) {
+        bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+        if (bytesReceived <= 0) {
+            break;
+        }
+
+        request.append(buffer, bytesReceived);
+
+        if (!headersDone) {
+            headerEndPos = request.find("\r\n\r\n");
+            if (headerEndPos != std::string::npos) {
+                headersDone = true;
+                std::string headers = request.substr(0, headerEndPos);
+                std::string headersLower = headers;
+                std::transform(headersLower.begin(), headersLower.end(), headersLower.begin(), ::tolower);
+
+                size_t pos = headersLower.find("content-length:");
+                if (pos != std::string::npos) {
+                    size_t lineEnd = headersLower.find("\r\n", pos);
+                    std::string lenStr = headersLower.substr(pos + 15,
+                        lineEnd == std::string::npos ? std::string::npos : lineEnd - (pos + 15));
+                    // trim leading spaces
+                    size_t start = lenStr.find_first_not_of(" \t");
+                    if (start != std::string::npos) {
+                        lenStr = lenStr.substr(start);
+                    }
+                    try {
+                        contentLength = std::stoul(lenStr);
+                    } catch (...) {
+                        contentLength = 0;
+                    }
+                }
+            }
+        }
+
+        if (headersDone) {
+            if (contentLength == 0) {
+                break;
+            }
+            size_t bodySize = request.size() - (headerEndPos + 4);
+            if (bodySize >= contentLength) {
+                break;
+            }
+        }
     }
     
     return request;
@@ -1548,6 +1611,8 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
     (void)cbType;
     (void)callbackInfo;
 
+    g_debugStepBusy.store(false);
+
     if (!g_runUntilUserCodeActive.load()) {
         return;
     }
@@ -1570,4 +1635,10 @@ void cbStopDebug(CBTYPE cbType, void* callbackInfo) {
     (void)callbackInfo;
     g_debugStepBusy.store(false);
     clearRunUntilUserCodeState();
+}
+
+void cbStepped(CBTYPE cbType, void* callbackInfo) {
+    (void)cbType;
+    (void)callbackInfo;
+    g_debugStepBusy.store(false);
 }
