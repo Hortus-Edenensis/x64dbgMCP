@@ -34,3 +34,4 @@ jobs:
           files: |
             build32/Release/MCPx64dbg.dp32
             build64/Release/MCPx64dbg.dp64
+            src/x64dbg.py

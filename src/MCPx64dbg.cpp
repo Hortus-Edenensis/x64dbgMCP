@@ -945,6 +945,21 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     ss << "]";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
+                else if (path == "/Disasm/GetInstructionAtRIP") {
+                    duint rip = Script::Register::Get(REG_IP);
+
+                    DISASM_INSTR instr;
+                    DbgDisasmAt(rip, &instr);
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"address\":\"0x" << std::hex << rip << "\",";
+                    ss << "\"instruction\":\"" << instr.instruction << "\",";
+                    ss << "\"size\":" << std::dec << instr.instr_size;
+                    ss << "}";
+
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
                 else if (path == "/Disasm/StepInWithDisasm") {
                     // Step in first
                     Script::Debug::StepIn();
@@ -965,6 +980,9 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     ss << "}";
                     
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else {
+                    sendHttpResponse(clientSocket, 404, "text/plain", "Unknown endpoint");
                 }
                 // =============================================================================
                 // FLAG API ENDPOINTS
