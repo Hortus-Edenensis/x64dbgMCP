@@ -23,6 +23,7 @@
 #include "pluginsdk/_scriptapi_gui.h"
 #include "pluginsdk/_scriptapi_misc.h"
 #include "pluginsdk/_dbgfunctions.h"
+#include "ServerLogic.h"
 #include <iomanip>  // For std::setw and std::setfill
 
 // Socket includes - after Windows.h
@@ -198,8 +199,6 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
 std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge);
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
 void parseHttpRequest(const std::string& request, std::string& method, std::string& path, std::string& query, std::string& body);
-std::unordered_map<std::string, std::string> parseQueryParams(const std::string& query);
-std::string urlDecode(const std::string& str);
 
 // Command callback declarations
 bool cbEnableHttpServer(int argc, char* argv[]);
@@ -319,27 +318,7 @@ void stopHttpServer() {
     }
 }
 
-// URL decode function
-std::string urlDecode(const std::string& str) {
-    std::string decoded;
-    for (size_t i = 0; i < str.length(); ++i) {
-        if (str[i] == '%' && i + 2 < str.length()) {
-            int value;
-            std::istringstream is(str.substr(i + 1, 2));
-            if (is >> std::hex >> value) {
-                decoded += static_cast<char>(value);
-                i += 2;
-            } else {
-                decoded += str[i];
-            }
-        } else if (str[i] == '+') {
-            decoded += ' ';
-        } else {
-            decoded += str[i];
-        }
-    }
-    return decoded;
-}
+
 
 // HTTP server thread function using standard Winsock
 DWORD WINAPI HttpServerThread(LPVOID lpParam) {
@@ -447,7 +426,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
             _plugin_logprintf("HTTP Request: %s %s\n", method.c_str(), path.c_str());
             
             // Parse query parameters
-            std::unordered_map<std::string, std::string> queryParams = parseQueryParams(query);
+            std::unordered_map<std::string, std::string> queryParams = ParseQueryParams(query);
 
             // Handle different endpoints
             try {
@@ -459,12 +438,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
                     }
 
                     std::string waitStr = queryParams["wait"];
-                    bool wait = false;
-                    if (!waitStr.empty()) {
-                        std::string lower = waitStr;
-                        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-                        wait = (lower == "1" || lower == "true" || lower == "yes" || lower == "on");
-                    }
+                    bool wait = ParseBool(waitStr, false);
                     
                     if (cmd.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing command parameter");
@@ -799,12 +773,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
                 }
                 else if (path == "/Debug/RunUntilUserCode") {
                     std::string autoStr = queryParams["autoResume"];
-                    bool autoResume = true;
-                    if (!autoStr.empty()) {
-                        std::string lower = autoStr;
-                        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-                        autoResume = !(lower == "0" || lower == "false" || lower == "no" || lower == "off");
-                    }
+                    bool autoResume = ParseBool(autoStr, true);
 
                     std::string jsonOut;
                     bool ok = startRunUntilUserCode(jsonOut, autoResume);
@@ -1287,7 +1256,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
                     std::string startStr = queryParams["start"];
                     std::string sizeStr = queryParams["size"];
                     std::string pattern = queryParams["pattern"];
-                    std::string Pattern = pattern;
+                    std::string Pattern = SanitizePattern(pattern);
                     if (startStr.empty() || sizeStr.empty() || pattern.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing start, size, or pattern parameter");
                         continue;
@@ -1295,10 +1264,7 @@ void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mut
                     
                     duint start = 0, size = 0;
 
-                    Pattern.erase(std::remove_if(Pattern.begin(), Pattern.end(),
-                                  [](unsigned char c) { return std::isspace(c); }),
-                    Pattern.end());
-
+                    
                     try {
                         if (startStr.substr(0, 2) == "0x") {
                             start = std::stoull(startStr.substr(2), nullptr, 16);
@@ -1610,33 +1576,7 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
     send(clientSocket, responseStr.c_str(), (int)responseStr.length(), 0);
 }
 
-// Parse query parameters from URL
-std::unordered_map<std::string, std::string> parseQueryParams(const std::string& query) {
-    std::unordered_map<std::string, std::string> params;
-    
-    size_t pos = 0;
-    size_t nextPos;
-    
-    while (pos < query.length()) {
-        nextPos = query.find('&', pos);
-        if (nextPos == std::string::npos) {
-            nextPos = query.length();
-        }
-        
-        std::string pair = query.substr(pos, nextPos - pos);
-        size_t equalPos = pair.find('=');
-        
-        if (equalPos != std::string::npos) {
-            std::string key = pair.substr(0, equalPos);
-            std::string value = pair.substr(equalPos + 1);
-            params[urlDecode(key)] = urlDecode(value);
-        }
-        
-        pos = nextPos + 1;
-    }
-    
-    return params;
-}
+
 
 // Command callback for toggling HTTP server
 bool cbEnableHttpServer(int argc, char* argv[]) {
@@ -1754,26 +1694,21 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
         stopStepBatch();
     }
 
-    if (!g_runUntilUserCodeActive.load()) {
-        return;
-    }
-
-    if (!g_runUntilUserCodeAutoResume.load()) {
-        clearRunUntilUserCodeState();
-        return;
-    }
-
-    if (g_runUntilUserCodeUserBpHit.load()) {
-        return;
-    }
-
     duint rip = Script::Register::Get(REG_IP);
-    if (isSystemModuleAddr(rip)) {
+    bool shouldResume = ShouldResumeAfterPause(
+        g_runUntilUserCodeActive.load(),
+        g_runUntilUserCodeAutoResume.load(),
+        g_runUntilUserCodeUserBpHit.load(),
+        isSystemModuleAddr(rip));
+
+    if (shouldResume) {
         DbgCmdExec("run");
         return;
     }
 
-    clearRunUntilUserCodeState();
+    if (g_runUntilUserCodeActive.load()) {
+        clearRunUntilUserCodeState();
+    }
 }
 
 void cbStopDebug(CBTYPE cbType, void* callbackInfo) {

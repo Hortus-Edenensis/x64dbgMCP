@@ -57,6 +57,7 @@ include_directories(
     ${X64DBG_SDK_PATH}/pluginsdk
     ${X64DBG_SDK_PATH}/pluginsdk/nlohmann  # Add nlohmann include path
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
 )
 
 # Add source files
@@ -148,3 +149,10 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo "Install manually to: $ENV{ProgramFiles}/x64dbg/release/x${ARCH_BITS}/plugins/${PROJECT_NAME}${PLUGIN_EXT}"
     COMMAND ${CMAKE_COMMAND} -E echo "================================="
 )
+# Unit tests
+option(BUILD_TESTS "Build unit tests" OFF)
+if(BUILD_TESTS)
+    add_executable(mcp_tests tests/test_server_logic.cpp src/ServerLogic.cpp)
+    target_include_directories(mcp_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    set_target_properties(mcp_tests PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+endif()

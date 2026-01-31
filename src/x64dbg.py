@@ -542,6 +542,7 @@ def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait
         max_cycles: Maximum run/pause cycles to attempt
         poll_interval_ms: Poll interval while waiting for a pause
         max_wait_ms: Max time to wait per run before giving up
+        auto_resume: When true, auto-continue on system-module pauses
 
     Returns:
         Dict with RIP/module info or error
