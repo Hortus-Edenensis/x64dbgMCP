@@ -42,6 +42,7 @@
 #include <cctype>
 #include <cstring>
 #include <atomic>
+#include <functional>
 // Link with ws2_32.lib
 #pragma comment(lib, "ws2_32.lib")
 
@@ -88,6 +89,7 @@ std::atomic<bool> g_runUntilUserCodeActive(false);
 std::atomic<bool> g_runUntilUserCodeUserBpHit(false);
 std::atomic<bool> g_runUntilUserCodeOwnsBp(false);
 duint g_runUntilUserCodeBp = 0;
+std::atomic<bool> g_debugStepBusy(false);
 
 // Helpers
 static bool isSystemModuleAddr(duint addr) {
@@ -107,6 +109,32 @@ static void clearRunUntilUserCodeState() {
     g_runUntilUserCodeUserBpHit.store(false);
     g_runUntilUserCodeOwnsBp.store(false);
     g_runUntilUserCodeBp = 0;
+}
+
+static void cancelRunUntilUserCodeIfActive() {
+    if (!g_runUntilUserCodeActive.load()) {
+        return;
+    }
+    if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
+        Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
+    }
+    clearRunUntilUserCodeState();
+}
+
+static bool queueDebugStep(const std::function<void()>& fn) {
+    bool expected = false;
+    if (!g_debugStepBusy.compare_exchange_strong(expected, true)) {
+        return false;
+    }
+    std::thread([fn]() {
+        try {
+            fn();
+        } catch (...) {
+            // Best-effort: keep server responsive even if debug step throws.
+        }
+        g_debugStepBusy.store(false);
+    }).detach();
+    return true;
 }
 
 // Forward declarations
@@ -705,16 +733,22 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     sendHttpResponse(clientSocket, 200, "text/plain", "Debug stop executed");
                 }
                 else if (path == "/Debug/StepIn") {
-                    Script::Debug::StepIn();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Step in executed");
+                    cancelRunUntilUserCodeIfActive();
+                    bool queued = queueDebugStep([]() { Script::Debug::StepIn(); });
+                    sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
+                        queued ? "Step in queued" : "Step in busy");
                 }
                 else if (path == "/Debug/StepOver") {
-                    Script::Debug::StepOver();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Step over executed");
+                    cancelRunUntilUserCodeIfActive();
+                    bool queued = queueDebugStep([]() { Script::Debug::StepOver(); });
+                    sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
+                        queued ? "Step over queued" : "Step over busy");
                 }
                 else if (path == "/Debug/StepOut") {
-                    Script::Debug::StepOut();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Step out executed");
+                    cancelRunUntilUserCodeIfActive();
+                    bool queued = queueDebugStep([]() { Script::Debug::StepOut(); });
+                    sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
+                        queued ? "Step out queued" : "Step out busy");
                 }
                 else if (path == "/Debug/SetBreakpoint") {
                     std::string addrStr = queryParams["addr"];
@@ -1534,5 +1568,6 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
 void cbStopDebug(CBTYPE cbType, void* callbackInfo) {
     (void)cbType;
     (void)callbackInfo;
+    g_debugStepBusy.store(false);
     clearRunUntilUserCodeState();
 }
