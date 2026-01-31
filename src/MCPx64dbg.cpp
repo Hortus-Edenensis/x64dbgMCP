@@ -25,6 +25,8 @@
 #include "pluginsdk/_dbgfunctions.h"
 #include "ServerLogic.h"
 #include <iomanip>  // For std::setw and std::setfill
+#include <cstdlib>
+#include <cstdio>
 
 // Socket includes - after Windows.h
 #include <winsock2.h>
@@ -77,7 +79,10 @@
 
 // Default settings
 #define DEFAULT_PORT 8888
-#define MAX_REQUEST_SIZE 1048576
+static const size_t DEFAULT_MAX_REQUEST_SIZE = 1048576;
+static const size_t DEFAULT_MAX_QUEUE_SIZE = 64;
+static const int DEFAULT_WORKER_COUNT = 4;
+static const size_t DEFAULT_MAX_EXEC_QUEUE = 32;
 
 // Global variables
 int g_pluginHandle;
@@ -91,9 +96,27 @@ std::condition_variable g_queueCv;
 std::queue<SOCKET> g_socketQueue;
 std::vector<std::thread> g_workerThreads;
 std::mutex g_execCommandMutex;
+size_t g_maxRequestSize = DEFAULT_MAX_REQUEST_SIZE;
+size_t g_maxQueueSize = DEFAULT_MAX_QUEUE_SIZE;
+int g_workerCount = DEFAULT_WORKER_COUNT;
+size_t g_maxExecQueue = DEFAULT_MAX_EXEC_QUEUE;
 
-static const size_t MAX_QUEUE_SIZE = 64;
-static const int WORKER_COUNT = 4;
+struct ExecCommandJob {
+    std::string id;
+    std::string cmd;
+    std::string output;
+    std::string error;
+    std::string status;
+    bool success = false;
+};
+
+std::mutex g_execJobsMutex;
+std::condition_variable g_execQueueCv;
+std::queue<std::string> g_execQueue;
+std::unordered_map<std::string, ExecCommandJob> g_execJobs;
+std::thread g_execWorkerThread;
+std::atomic<bool> g_execWorkerRunning(false);
+std::atomic<unsigned long long> g_execJobCounter(0);
 
 // Run-until-user-code state
 std::atomic<bool> g_runUntilUserCodeActive(false);
@@ -116,6 +139,76 @@ static bool isSystemModuleAddr(duint addr) {
         return true;
     }
     return dbg->ModGetParty(base) == mod_system;
+}
+
+static size_t readSizeEnv(const char* name, size_t defaultValue, size_t minValue, size_t maxValue) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return defaultValue;
+    }
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (end == raw) {
+        return defaultValue;
+    }
+    size_t value = static_cast<size_t>(parsed);
+    if (value < minValue) {
+        value = minValue;
+    }
+    if (value > maxValue) {
+        value = maxValue;
+    }
+    return value;
+}
+
+static int readIntEnv(const char* name, int defaultValue, int minValue, int maxValue) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return defaultValue;
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(raw, &end, 10);
+    if (end == raw) {
+        return defaultValue;
+    }
+    int value = static_cast<int>(parsed);
+    if (value < minValue) {
+        value = minValue;
+    }
+    if (value > maxValue) {
+        value = maxValue;
+    }
+    return value;
+}
+
+static void loadServerConfigFromEnv() {
+    g_workerCount = readIntEnv("X64DBG_HTTP_WORKERS", DEFAULT_WORKER_COUNT, 1, 32);
+    g_maxQueueSize = readSizeEnv("X64DBG_HTTP_QUEUE", DEFAULT_MAX_QUEUE_SIZE, 8, 1024);
+    g_maxRequestSize = readSizeEnv("X64DBG_HTTP_MAX_REQUEST", DEFAULT_MAX_REQUEST_SIZE, 8192, 8 * 1024 * 1024);
+    g_maxExecQueue = readSizeEnv("X64DBG_EXEC_QUEUE", DEFAULT_MAX_EXEC_QUEUE, 1, 256);
+}
+
+static std::string jsonEscape(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 16);
+    for (unsigned char c : input) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[7];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
 }
 
 static void clearRunUntilUserCodeState() {
@@ -197,6 +290,159 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
 
     jsonOut = ss.str();
     return submitted;
+}
+
+static std::string makeExecJobId() {
+    unsigned long long counter = g_execJobCounter.fetch_add(1);
+    unsigned long long tick = GetTickCount64();
+    std::stringstream ss;
+    ss << std::hex << tick << "_" << counter;
+    return ss.str();
+}
+
+static bool enqueueExecCommandJob(const std::string& cmd, std::string& jobIdOut, std::string& errorOut) {
+    std::lock_guard<std::mutex> lock(g_execJobsMutex);
+    if (g_execQueue.size() >= g_maxExecQueue) {
+        errorOut = "Exec queue full";
+        return false;
+    }
+    std::string jobId = makeExecJobId();
+    ExecCommandJob job;
+    job.id = jobId;
+    job.cmd = cmd;
+    job.status = "queued";
+    g_execJobs.emplace(jobId, job);
+    g_execQueue.push(jobId);
+    g_execQueueCv.notify_one();
+    jobIdOut = jobId;
+    return true;
+}
+
+static void execCommandWorkerLoop() {
+    while (g_execWorkerRunning.load()) {
+        std::string jobId;
+        {
+            std::unique_lock<std::mutex> lock(g_execJobsMutex);
+            g_execQueueCv.wait(lock, [] {
+                return !g_execWorkerRunning.load() || !g_execQueue.empty();
+            });
+            if (!g_execWorkerRunning.load() && g_execQueue.empty()) {
+                return;
+            }
+            if (!g_execQueue.empty()) {
+                jobId = g_execQueue.front();
+                g_execQueue.pop();
+                auto it = g_execJobs.find(jobId);
+                if (it != g_execJobs.end()) {
+                    it->second.status = "running";
+                }
+            }
+        }
+
+        if (jobId.empty()) {
+            continue;
+        }
+
+        std::string cmd;
+        {
+            std::lock_guard<std::mutex> lock(g_execJobsMutex);
+            auto it = g_execJobs.find(jobId);
+            if (it == g_execJobs.end()) {
+                continue;
+            }
+            cmd = it->second.cmd;
+        }
+
+        std::string output;
+        std::string error;
+        bool success = false;
+
+        char tempPath[MAX_PATH];
+        GetTempPathA(MAX_PATH, tempPath);
+        char tempFile[MAX_PATH];
+        if (!GetTempFileNameA(tempPath, "xdbg", 0, tempFile)) {
+            error = "Failed to create temp file";
+        } else {
+            std::string logFile = tempFile;
+            {
+                std::lock_guard<std::mutex> execLock(g_execCommandMutex);
+                GuiLogRedirect(logFile.c_str());
+                success = DbgCmdExecDirect(cmd.c_str());
+                GuiFlushLog();
+                Sleep(300);
+                GuiLogRedirectStop();
+                Sleep(100);
+            }
+
+            std::ifstream file(logFile);
+            if (file) {
+                std::stringstream buffer;
+                buffer << file.rdbuf();
+                output = buffer.str();
+            }
+            DeleteFileA(logFile.c_str());
+        }
+
+        if (output.empty()) {
+            output = success ? "Command executed (no output)" : "Command failed";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_execJobsMutex);
+            auto it = g_execJobs.find(jobId);
+            if (it == g_execJobs.end()) {
+                continue;
+            }
+            it->second.output = output;
+            it->second.error = error;
+            it->second.success = success;
+            it->second.status = success ? "done" : "failed";
+        }
+    }
+}
+
+static void startExecCommandWorker() {
+    if (g_execWorkerRunning.load()) {
+        return;
+    }
+    g_execWorkerRunning.store(true);
+    g_execWorkerThread = std::thread(execCommandWorkerLoop);
+}
+
+static void stopExecCommandWorker() {
+    if (!g_execWorkerRunning.load()) {
+        return;
+    }
+    g_execWorkerRunning.store(false);
+    g_execQueueCv.notify_all();
+    if (g_execWorkerThread.joinable()) {
+        g_execWorkerThread.join();
+    }
+    std::lock_guard<std::mutex> lock(g_execJobsMutex);
+    while (!g_execQueue.empty()) {
+        g_execQueue.pop();
+    }
+    g_execJobs.clear();
+}
+
+static bool addStepBatch(int count) {
+    if (count <= 0) {
+        return false;
+    }
+    if (g_stepBatchActive.load()) {
+        g_stepBatchRemaining.fetch_add(count);
+        return true;
+    }
+    if (g_debugStepBusy.load()) {
+        bool expected = false;
+        if (g_stepBatchActive.compare_exchange_strong(expected, true)) {
+            g_stepBatchRemaining.store(count + 1);
+        } else {
+            g_stepBatchRemaining.fetch_add(count);
+        }
+        return true;
+    }
+    return startStepBatch(count);
 }
 
 // Forward declarations
@@ -293,11 +539,15 @@ bool startHttpServer() {
     if (g_httpServerRunning) {
         stopHttpServer();
     }
+
+    loadServerConfigFromEnv();
+    startExecCommandWorker();
     
     // Create and start the server thread
     g_httpServerThread = CreateThread(NULL, 0, HttpServerThread, NULL, 0, NULL);
     if (g_httpServerThread == NULL) {
         _plugin_logputs("Failed to create HTTP server thread");
+        stopExecCommandWorker();
         return false;
     }
     
@@ -312,6 +562,7 @@ void stopHttpServer() {
     if (g_httpServerRunning) {
         g_httpServerRunning = false;
         g_queueCv.notify_all();
+        stopExecCommandWorker();
         
         // Close the server socket to unblock any accept calls
         if (g_serverSocket != INVALID_SOCKET) {
@@ -370,6 +621,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     }
     
     _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
+    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu\n",
+                      g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue);
     
     // Set socket to non-blocking mode
     u_long mode = 1;
@@ -377,8 +630,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     
     // Start worker threads
     g_workerThreads.clear();
-    g_workerThreads.reserve(WORKER_COUNT);
-    for (int i = 0; i < WORKER_COUNT; ++i) {
+    g_workerThreads.reserve(static_cast<size_t>(g_workerCount));
+    for (int i = 0; i < g_workerCount; ++i) {
         g_workerThreads.emplace_back(workerThreadLoop);
     }
 
@@ -405,7 +658,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         }
         {
             std::lock_guard<std::mutex> lock(g_queueMutex);
-            if (g_socketQueue.size() >= MAX_QUEUE_SIZE) {
+            if (g_socketQueue.size() >= g_maxQueueSize) {
                 sendHttpResponse(clientSocket, 429, "text/plain", "Server busy");
                 closesocket(clientSocket);
                 continue;
@@ -509,45 +762,64 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
 
-                    // Generate unique log file path
-                    char tempPath[MAX_PATH];
-                    GetTempPathA(MAX_PATH, tempPath);
-                    char tempFile[MAX_PATH];
-                    if (!GetTempFileNameA(tempPath, "xdbg", 0, tempFile)) {
-                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to create temp file");
+                    std::string jobId;
+                    std::string error;
+                    bool queued = enqueueExecCommandJob(cmd, jobId, error);
+                    if (!queued) {
+                        sendHttpResponse(clientSocket, 503, "text/plain",
+                            error.empty() ? "Failed to queue command" : error);
                         continue;
                     }
-                    std::string logFile = tempFile;
-                    
-                    std::lock_guard<std::mutex> execLock(g_execCommandMutex);
-                    // Clear the log first
-                    GuiLogRedirect(logFile.c_str());
-                    // Execute the command
-                    bool success = DbgCmdExecDirect(cmd.c_str());
-                    GuiFlushLog();
-                    Sleep(300);
-                    GuiLogRedirectStop();
-                    // Wait for command to complete
-                    Sleep(100);
-                
-                    
-                    // Read the saved log
-                    std::string output;
-                    std::ifstream file(logFile);
-                    if (file) {
-                        std::stringstream buffer;
-                        buffer << file.rdbuf();
-                        output = buffer.str();
-                    }
-                 
-                    
-                    std::string response = output.empty() 
-                        ? (success ? "Command executed (no output)" : "Command failed")
-                        : output;
-                    DeleteFileA(logFile.c_str());
-                    sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", response);
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"job_id\":\"" << jsonEscape(jobId) << "\",";
+                    ss << "\"queued\":true";
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 202, "application/json", ss.str());
                 }
-                                else if (path == "/IsDebugActive") {
+                else if (path == "/ExecCommand/Result") {
+                    std::string jobId = queryParams["id"];
+                    if (jobId.empty()) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Missing id parameter");
+                        continue;
+                    }
+                    bool consume = ParseBool(queryParams["consume"], false);
+
+                    ExecCommandJob job;
+                    bool found = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_execJobsMutex);
+                        auto it = g_execJobs.find(jobId);
+                        if (it != g_execJobs.end()) {
+                            job = it->second;
+                            found = true;
+                            if (consume && (job.status == "done" || job.status == "failed")) {
+                                g_execJobs.erase(it);
+                            }
+                        }
+                    }
+
+                    if (!found) {
+                        sendHttpResponse(clientSocket, 404, "text/plain", "Unknown job id");
+                        continue;
+                    }
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"job_id\":\"" << jsonEscape(job.id) << "\",";
+                    ss << "\"status\":\"" << jsonEscape(job.status) << "\",";
+                    ss << "\"success\":" << (job.success ? "true" : "false");
+                    if (!job.output.empty()) {
+                        ss << ",\"output\":\"" << jsonEscape(job.output) << "\"";
+                    }
+                    if (!job.error.empty()) {
+                        ss << ",\"error\":\"" << jsonEscape(job.error) << "\"";
+                    }
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/IsDebugActive") {
                     bool isRunning = DbgIsRunning();
                     _plugin_logprintf("DbgIsRunning() called, result: %s\n", isRunning ? "true" : "false");
                     std::stringstream ss;
@@ -866,7 +1138,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
                         continue;
                     }
-                    bool queued = queueDebugStepCommand("sto");
+                    bool queued = addStepBatch(1);
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step over queued" : "Step over busy");
                 }
@@ -889,7 +1161,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid count");
                         continue;
                     }
-                    bool started = startStepBatch(count);
+                    bool started = addStepBatch(count);
                     sendHttpResponse(clientSocket, started ? 200 : 409, "text/plain",
                         started ? "Step over batch queued" : "Step over busy");
                 }
@@ -1490,7 +1762,7 @@ std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge) {
         *tooLarge = false;
     }
 
-    while (request.size() < MAX_REQUEST_SIZE) {
+    while (request.size() < g_maxRequestSize) {
         bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
         if (bytesReceived <= 0) {
             break;
@@ -1521,7 +1793,7 @@ std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge) {
                     } catch (...) {
                         contentLength = 0;
                     }
-                    if (contentLength > MAX_REQUEST_SIZE) {
+                    if (contentLength > g_maxRequestSize) {
                         if (tooLarge) {
                             *tooLarge = true;
                         }
@@ -1542,7 +1814,7 @@ std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge) {
         }
     }
 
-    if (request.size() >= MAX_REQUEST_SIZE) {
+    if (request.size() >= g_maxRequestSize) {
         if (tooLarge) {
             *tooLarge = true;
         }

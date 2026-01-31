@@ -11,6 +11,27 @@ from mcp.server.fastmcp import FastMCP
 DEFAULT_X64DBG_SERVER = "http://127.0.0.1:8888/"
 DEFAULT_REQUEST_TIMEOUT_SEC = 30
 
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+DEFAULT_EXEC_WAIT_SEC = _read_int_env("X64DBG_EXEC_WAIT_SEC", 30)
+DEFAULT_EXEC_POLL_SEC = _read_float_env("X64DBG_EXEC_POLL_SEC", 0.2)
+
 def _resolve_server_url_from_args_env() -> str:
     env_url = os.getenv("X64DBG_URL")
     if env_url and env_url.startswith("http"):
@@ -76,6 +97,14 @@ def safe_post(endpoint: str, data: dict | str):
             return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
         return f"Request failed: {str(e)}"
+
+def _is_error_response(result: Any) -> bool:
+    if isinstance(result, dict) and "error" in result:
+        return True
+    if isinstance(result, str):
+        lower = result.lower()
+        return lower.startswith("error") or lower.startswith("request failed")
+    return False
 
 def _normalize_windows_path(path: str) -> str:
     if not path:
@@ -242,7 +271,43 @@ def ExecCommand(cmd: str, wait: bool = False) -> str:
     Returns:
         Command execution status and output
     """
-    return safe_get("ExecCommand", {"cmd": cmd, "wait": "1" if wait else "0"})
+    result = safe_get("ExecCommand", {"cmd": cmd, "wait": "1" if wait else "0"})
+    if not wait:
+        return result
+    if _is_error_response(result):
+        return result
+    if isinstance(result, dict) and "job_id" in result:
+        job_id = result["job_id"]
+        deadline = time.time() + max(DEFAULT_EXEC_WAIT_SEC, 1)
+        poll_delay = max(DEFAULT_EXEC_POLL_SEC, 0.05)
+        while time.time() < deadline:
+            job = safe_get("ExecCommand/Result", {"id": job_id})
+            if _is_error_response(job):
+                return job
+            if isinstance(job, dict):
+                status = job.get("status")
+                if status in ("done", "failed"):
+                    return job.get("output") or job.get("error") or ""
+            time.sleep(poll_delay)
+        return {"error": "Timed out waiting for command result", "job_id": job_id}
+    return result
+
+@mcp.tool()
+def ExecCommandResult(job_id: str, consume: bool = False) -> Any:
+    """
+    Retrieve the result of an async ExecCommand job
+
+    Parameters:
+        job_id: Job identifier returned by ExecCommand(wait=True)
+        consume: Remove the job entry after completion
+
+    Returns:
+        Job status and output
+    """
+    params = {"id": job_id}
+    if consume:
+        params["consume"] = "1"
+    return safe_get("ExecCommand/Result", params)
 
 # =============================================================================
 # DEBUGGING STATUS
@@ -257,6 +322,10 @@ def IsDebugActive() -> bool:
         True if running, False otherwise
     """
     result = safe_get("IsDebugActive")
+    if isinstance(result, dict) and "error" in result:
+        return result
+    if isinstance(result, str) and _is_error_response(result):
+        return {"error": result}
     if isinstance(result, dict) and "isRunning" in result:
         return result["isRunning"] is True
     if isinstance(result, str):
@@ -277,6 +346,10 @@ def IsDebugging() -> bool:
         True if debugging, False otherwise
     """
     result = safe_get("Is_Debugging")
+    if isinstance(result, dict) and "error" in result:
+        return result
+    if isinstance(result, str) and _is_error_response(result):
+        return {"error": result}
     if isinstance(result, dict) and "isDebugging" in result:
         return result["isDebugging"] is True
     if isinstance(result, str):
