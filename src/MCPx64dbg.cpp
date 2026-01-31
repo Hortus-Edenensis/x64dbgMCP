@@ -374,6 +374,8 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
     return submitted;
 }
 
+void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
+
 static bool ensureDebugging(SOCKET clientSocket) {
     if (!DbgIsDebugging()) {
         sendHttpResponse(clientSocket, 409, "text/plain", "No active debug session");
