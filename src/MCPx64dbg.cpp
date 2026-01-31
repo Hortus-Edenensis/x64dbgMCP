@@ -194,7 +194,7 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
 bool startHttpServer();
 void stopHttpServer();
 DWORD WINAPI HttpServerThread(LPVOID lpParam);
-void handleClientConnection(SOCKET clientSocket);
+void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mutex> requestLock);
 std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge);
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
 void parseHttpRequest(const std::string& request, std::string& method, std::string& path, std::string& query, std::string& body);
@@ -407,8 +407,14 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
             Sleep(100); // Avoid tight loop
             continue;
         }
-        
-        std::thread(handleClientConnection, clientSocket).detach();
+        std::unique_lock<std::timed_mutex> requestLock(g_requestMutex, std::defer_lock);
+        if (!requestLock.try_lock_for(std::chrono::milliseconds(100))) {
+            sendHttpResponse(clientSocket, 429, "text/plain", "Server busy");
+            closesocket(clientSocket);
+            continue;
+        }
+
+        std::thread(handleClientConnection, clientSocket, std::move(requestLock)).detach();
     }
 
     // Clean up
@@ -422,7 +428,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
 }
 
 
-void handleClientConnection(SOCKET clientSocket) {
+void handleClientConnection(SOCKET clientSocket, std::unique_lock<std::timed_mutex> requestLock) {
+    (void)requestLock;
     do {
         // Read the HTTP request
         bool tooLarge = false;
@@ -442,12 +449,6 @@ void handleClientConnection(SOCKET clientSocket) {
             // Parse query parameters
             std::unordered_map<std::string, std::string> queryParams = parseQueryParams(query);
 
-            std::unique_lock<std::timed_mutex> requestLock(g_requestMutex, std::chrono::milliseconds(100));
-            if (!requestLock.owns_lock()) {
-                sendHttpResponse(clientSocket, 429, "text/plain", "Server busy");
-                break;
-            }
-            
             // Handle different endpoints
             try {
                 // Unified command execution endpoint
@@ -455,9 +456,6 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string cmd = queryParams["cmd"];
                     if (cmd.empty() && !body.empty()) {
                         cmd = body;
-                    }
-                     else {
-                        cmd = urlDecode(cmd);  
                     }
 
                     std::string waitStr = queryParams["wait"];
@@ -969,8 +967,6 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string cmdline = queryParams["cmdline"];
                     if (cmdline.empty() && !body.empty()) {
                         cmdline = body;
-                    } else {
-                        cmdline = urlDecode(cmdline);
                     }
 
                     if (cmdline.empty()) {
@@ -1206,25 +1202,27 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Disasm/StepInWithDisasm") {
-                    // Step in first
-                    Script::Debug::StepIn();
-                    
-                    // Then get current instruction
+                    cancelRunUntilUserCodeIfActive();
+                    if (DbgIsRunning()) {
+                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                        continue;
+                    }
+
                     duint rip = Script::Register::Get(REG_IP);
-                    
                     DISASM_INSTR instr;
                     DbgDisasmAt(rip, &instr);
-                    
-                    // Create JSON response
+
+                    bool queued = queueDebugStepCommand("sti");
+
                     std::stringstream ss;
                     ss << "{";
-                    ss << "\"step_result\":\"Step in executed\",";
-                    ss << "\"rip\":\"0x" << std::hex << rip << "\",";
-                    ss << "\"instruction\":\"" << instr.instruction << "\",";
+                    ss << "\"queued\":" << (queued ? "true" : "false") << ",";
+                    ss << "\"rip_before\":\"0x" << std::hex << rip << "\",";
+                    ss << "\"instruction_before\":\"" << instr.instruction << "\",";
                     ss << "\"size\":" << std::dec << instr.instr_size;
                     ss << "}";
-                    
-                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+
+                    sendHttpResponse(clientSocket, queued ? 200 : 409, "application/json", ss.str());
                 }
                 // =============================================================================
                 // FLAG API ENDPOINTS
@@ -1289,7 +1287,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string startStr = queryParams["start"];
                     std::string sizeStr = queryParams["size"];
                     std::string pattern = queryParams["pattern"];
-                    std::string Pattern = urlDecode(pattern);
+                    std::string Pattern = pattern;
                     if (startStr.empty() || sizeStr.empty() || pattern.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing start, size, or pattern parameter");
                         continue;
@@ -1297,8 +1295,8 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     duint start = 0, size = 0;
 
-                    Pattern.erase(std::remove_if(pattern.begin(), pattern.end(), 
-                                  [](unsigned char c) { return std::isspace(c); }), 
+                    Pattern.erase(std::remove_if(Pattern.begin(), Pattern.end(),
+                                  [](unsigned char c) { return std::isspace(c); }),
                     Pattern.end());
 
                     try {
@@ -1631,7 +1629,7 @@ std::unordered_map<std::string, std::string> parseQueryParams(const std::string&
         if (equalPos != std::string::npos) {
             std::string key = pair.substr(0, equalPos);
             std::string value = pair.substr(equalPos + 1);
-            params[key] = value;
+            params[urlDecode(key)] = urlDecode(value);
         }
         
         pos = nextPos + 1;
@@ -1711,7 +1709,7 @@ void cbSystemBreakpoint(CBTYPE cbType, void* callbackInfo) {
     (void)cbType;
     (void)callbackInfo;
 
-    if (g_runUntilUserCodeActive.load()) {
+    if (g_runUntilUserCodeActive.load() && g_runUntilUserCodeAutoResume.load()) {
         DbgCmdExec("run");
     }
 }
