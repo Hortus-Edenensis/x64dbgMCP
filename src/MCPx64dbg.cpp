@@ -86,6 +86,7 @@ static const size_t DEFAULT_MAX_EXEC_QUEUE = 32;
 static const size_t DEFAULT_MAX_EXEC_JOBS = 128;
 static const size_t DEFAULT_MAX_EXEC_OUTPUT = 256 * 1024;
 static const unsigned long long DEFAULT_EXEC_TTL_MS = 5ULL * 60ULL * 1000ULL;
+static const bool DEFAULT_EXEC_REDIRECT = true;
 
 // Global variables
 int g_pluginHandle;
@@ -106,6 +107,7 @@ size_t g_maxExecQueue = DEFAULT_MAX_EXEC_QUEUE;
 size_t g_maxExecJobs = DEFAULT_MAX_EXEC_JOBS;
 size_t g_maxExecOutput = DEFAULT_MAX_EXEC_OUTPUT;
 unsigned long long g_execJobTtlMs = DEFAULT_EXEC_TTL_MS;
+bool g_execRedirectEnabled = DEFAULT_EXEC_REDIRECT;
 
 struct ExecCommandJob {
     std::string id;
@@ -183,6 +185,32 @@ static bool parseAddressMaybeHex(const std::string& text, duint& valueOut) {
     return true;
 }
 
+static bool sanitizeHexBytes(const std::string& input, std::string& output) {
+    output.clear();
+    output.reserve(input.size());
+    bool sawPrefix = false;
+    for (size_t i = 0; i < input.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(input[i]);
+        if (std::isspace(c)) {
+            continue;
+        }
+        if (!sawPrefix && output.empty() && c == '0' && i + 1 < input.size() &&
+            (input[i + 1] == 'x' || input[i + 1] == 'X')) {
+            sawPrefix = true;
+            ++i;
+            continue;
+        }
+        if (!std::isxdigit(c)) {
+            return false;
+        }
+        output.push_back(static_cast<char>(c));
+    }
+    if (output.empty()) {
+        return false;
+    }
+    return (output.size() % 2) == 0;
+}
+
 static size_t readSizeEnv(const char* name, size_t defaultValue, size_t minValue, size_t maxValue) {
     const char* raw = std::getenv(name);
     if (!raw || !*raw) {
@@ -223,6 +251,14 @@ static int readIntEnv(const char* name, int defaultValue, int minValue, int maxV
     return value;
 }
 
+static bool readBoolEnv(const char* name, bool defaultValue) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return defaultValue;
+    }
+    return ParseBool(raw, defaultValue);
+}
+
 static void loadServerConfigFromEnv() {
     g_workerCount = readIntEnv("X64DBG_HTTP_WORKERS", DEFAULT_WORKER_COUNT, 1, 32);
     g_maxQueueSize = readSizeEnv("X64DBG_HTTP_QUEUE", DEFAULT_MAX_QUEUE_SIZE, 8, 1024);
@@ -231,6 +267,7 @@ static void loadServerConfigFromEnv() {
     g_maxExecJobs = readSizeEnv("X64DBG_EXEC_MAX_JOBS", DEFAULT_MAX_EXEC_JOBS, 16, 2048);
     g_maxExecOutput = readSizeEnv("X64DBG_EXEC_MAX_OUTPUT", DEFAULT_MAX_EXEC_OUTPUT, 16 * 1024, 4 * 1024 * 1024);
     g_execJobTtlMs = readSizeEnv("X64DBG_EXEC_TTL_MS", DEFAULT_EXEC_TTL_MS, 10 * 1000, 60ULL * 60ULL * 1000ULL);
+    g_execRedirectEnabled = readBoolEnv("X64DBG_EXEC_REDIRECT", DEFAULT_EXEC_REDIRECT);
 }
 
 static std::string jsonEscape(const std::string& input) {
@@ -419,30 +456,34 @@ static void execCommandWorkerLoop() {
         std::string error;
         bool success = false;
 
-        char tempPath[MAX_PATH];
-        GetTempPathA(MAX_PATH, tempPath);
-        char tempFile[MAX_PATH];
-        if (!GetTempFileNameA(tempPath, "xdbg", 0, tempFile)) {
-            error = "Failed to create temp file";
+        if (!g_execRedirectEnabled) {
+            success = DbgCmdExecDirect(cmd.c_str());
         } else {
-            std::string logFile = tempFile;
-            {
-                std::lock_guard<std::mutex> execLock(g_execCommandMutex);
-                GuiLogRedirect(logFile.c_str());
-                success = DbgCmdExecDirect(cmd.c_str());
-                GuiFlushLog();
-                Sleep(300);
-                GuiLogRedirectStop();
-                Sleep(100);
-            }
+            char tempPath[MAX_PATH];
+            GetTempPathA(MAX_PATH, tempPath);
+            char tempFile[MAX_PATH];
+            if (!GetTempFileNameA(tempPath, "xdbg", 0, tempFile)) {
+                error = "Failed to create temp file";
+            } else {
+                std::string logFile = tempFile;
+                {
+                    std::lock_guard<std::mutex> execLock(g_execCommandMutex);
+                    GuiLogRedirect(logFile.c_str());
+                    success = DbgCmdExecDirect(cmd.c_str());
+                    GuiFlushLog();
+                    Sleep(200);
+                    GuiLogRedirectStop();
+                    Sleep(50);
+                }
 
-            std::ifstream file(logFile);
-            if (file) {
-                std::stringstream buffer;
-                buffer << file.rdbuf();
-                output = buffer.str();
+                std::ifstream file(logFile);
+                if (file) {
+                    std::stringstream buffer;
+                    buffer << file.rdbuf();
+                    output = buffer.str();
+                }
+                DeleteFileA(logFile.c_str());
             }
-            DeleteFileA(logFile.c_str());
         }
 
         if (output.empty()) {
@@ -470,6 +511,7 @@ static void execCommandWorkerLoop() {
             it->second.status = success ? "done" : "failed";
             it->second.truncated = truncated;
             it->second.finishedAtMs = GetTickCount64();
+            pruneExecJobsLocked(it->second.finishedAtMs);
         }
     }
 }
@@ -632,14 +674,15 @@ bool startHttpServer() {
     startExecCommandWorker();
     
     // Create and start the server thread
+    g_httpServerRunning.store(true);
     g_httpServerThread = CreateThread(NULL, 0, HttpServerThread, NULL, 0, NULL);
     if (g_httpServerThread == NULL) {
         _plugin_logputs("Failed to create HTTP server thread");
+        g_httpServerRunning.store(false);
         stopExecCommandWorker();
         return false;
     }
     
-    g_httpServerRunning.store(true);
     return true;
 }
 
@@ -717,13 +760,9 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     }
     
     _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
-    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu\n",
+    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s\n",
                       g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue,
-                      g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs);
-    
-    // Set socket to non-blocking mode
-    u_long mode = 1;
-    ioctlsocket(g_serverSocket, FIONBIO, &mode);
+                      g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs, g_execRedirectEnabled ? "true" : "false");
     
     // Start worker threads
     g_workerThreads.clear();
@@ -740,17 +779,10 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         SOCKET clientSocket = accept(g_serverSocket, (sockaddr*)&clientAddr, &clientAddrSize);
         
         if (clientSocket == INVALID_SOCKET) {
-            // Check if we need to exit
             if (!g_httpServerRunning.load()) {
                 break;
             }
-            
-            // Non-blocking socket may return WOULD_BLOCK when no connections are pending
-            if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                _plugin_logprintf("Accept failed with error: %d\n", WSAGetLastError());
-            }
-            
-            Sleep(100); // Avoid tight loop
+            _plugin_logprintf("Accept failed with error: %d\n", WSAGetLastError());
             continue;
         }
         {
@@ -1086,13 +1118,37 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     std::vector<unsigned char> buffer(size);
                     duint sizeRead = 0;
-                    
-                    if (!Script::Memory::Read(addr, buffer.data(), size, &sizeRead)) {
-                        unsigned int protect = Script::Memory::GetProtect(addr);
-                        std::stringstream err;
-                        err << "Failed to read memory (protect=0x" << std::hex << protect << ")";
-                        sendHttpResponse(clientSocket, 500, "text/plain", err.str());
-                        continue;
+                    bool fullRead = Script::Memory::Read(addr, buffer.data(), size, &sizeRead);
+                    if (!fullRead || sizeRead != size) {
+                        SYSTEM_INFO sysInfo;
+                        GetSystemInfo(&sysInfo);
+                        size_t pageSize = sysInfo.dwPageSize ? sysInfo.dwPageSize : 0x1000;
+                        duint remaining = size;
+                        duint totalRead = 0;
+                        duint cursor = addr;
+                        while (remaining > 0) {
+                            size_t pageOffset = static_cast<size_t>(cursor % pageSize);
+                            duint chunk = static_cast<duint>(std::min<unsigned long long>(remaining, pageSize - pageOffset));
+                            duint chunkRead = 0;
+                            if (!Script::Memory::Read(cursor, buffer.data() + totalRead, chunk, &chunkRead) || chunkRead == 0) {
+                                break;
+                            }
+                            totalRead += chunkRead;
+                            cursor += chunkRead;
+                            remaining -= chunkRead;
+                            if (chunkRead < chunk) {
+                                break;
+                            }
+                        }
+
+                        sizeRead = totalRead;
+                        if (sizeRead == 0) {
+                            unsigned int protect = Script::Memory::GetProtect(addr);
+                            std::stringstream err;
+                            err << "Failed to read memory (protect=0x" << std::hex << protect << ")";
+                            sendHttpResponse(clientSocket, 500, "text/plain", err.str());
+                            continue;
+                        }
                     }
                     
                     std::stringstream ss;
@@ -1100,7 +1156,8 @@ void handleClientConnection(SOCKET clientSocket) {
                         ss << std::setw(2) << std::setfill('0') << std::hex << (int)buffer[i];
                     }
                     
-                    sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
+                    int status = (sizeRead == size) ? 200 : 206;
+                    sendHttpResponse(clientSocket, status, "text/plain", ss.str());
                 }
                 else if (path == "/Memory/Write") {
                     std::string addrStr = queryParams["addr"];
@@ -1117,10 +1174,16 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
+                    std::string cleaned;
+                    if (!sanitizeHexBytes(dataStr, cleaned)) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid data format");
+                        continue;
+                    }
+
                     std::vector<unsigned char> buffer;
-                    for (size_t i = 0; i < dataStr.length(); i += 2) {
-                        if (i + 1 >= dataStr.length()) break;
-                        std::string byteString = dataStr.substr(i, 2);
+                    buffer.reserve(cleaned.size() / 2);
+                    for (size_t i = 0; i < cleaned.length(); i += 2) {
+                        std::string byteString = cleaned.substr(i, 2);
                         try {
                             unsigned char byte = (unsigned char)std::stoi(byteString, nullptr, 16);
                             buffer.push_back(byte);
@@ -1951,10 +2014,13 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
     std::string statusText;
     switch (statusCode) {
         case 200: statusText = "OK"; break;
+        case 206: statusText = "Partial Content"; break;
+        case 400: statusText = "Bad Request"; break;
         case 409: statusText = "Conflict"; break;
         case 413: statusText = "Payload Too Large"; break;
         case 429: statusText = "Too Many Requests"; break;
         case 404: statusText = "Not Found"; break;
+        case 503: statusText = "Service Unavailable"; break;
         case 500: statusText = "Internal Server Error"; break;
         default: statusText = "Unknown";
     }
