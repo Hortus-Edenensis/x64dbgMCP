@@ -83,11 +83,14 @@ static const size_t DEFAULT_MAX_REQUEST_SIZE = 1048576;
 static const size_t DEFAULT_MAX_QUEUE_SIZE = 64;
 static const int DEFAULT_WORKER_COUNT = 4;
 static const size_t DEFAULT_MAX_EXEC_QUEUE = 32;
+static const size_t DEFAULT_MAX_EXEC_JOBS = 128;
+static const size_t DEFAULT_MAX_EXEC_OUTPUT = 256 * 1024;
+static const unsigned long long DEFAULT_EXEC_TTL_MS = 5ULL * 60ULL * 1000ULL;
 
 // Global variables
 int g_pluginHandle;
 HANDLE g_httpServerThread = NULL;
-bool g_httpServerRunning = false;
+std::atomic<bool> g_httpServerRunning(false);
 int g_httpPort = DEFAULT_PORT;
 std::mutex g_httpMutex;
 SOCKET g_serverSocket = INVALID_SOCKET;
@@ -100,6 +103,9 @@ size_t g_maxRequestSize = DEFAULT_MAX_REQUEST_SIZE;
 size_t g_maxQueueSize = DEFAULT_MAX_QUEUE_SIZE;
 int g_workerCount = DEFAULT_WORKER_COUNT;
 size_t g_maxExecQueue = DEFAULT_MAX_EXEC_QUEUE;
+size_t g_maxExecJobs = DEFAULT_MAX_EXEC_JOBS;
+size_t g_maxExecOutput = DEFAULT_MAX_EXEC_OUTPUT;
+unsigned long long g_execJobTtlMs = DEFAULT_EXEC_TTL_MS;
 
 struct ExecCommandJob {
     std::string id;
@@ -108,6 +114,9 @@ struct ExecCommandJob {
     std::string error;
     std::string status;
     bool success = false;
+    bool truncated = false;
+    unsigned long long createdAtMs = 0;
+    unsigned long long finishedAtMs = 0;
 };
 
 std::mutex g_execJobsMutex;
@@ -139,6 +148,39 @@ static bool isSystemModuleAddr(duint addr) {
         return true;
     }
     return dbg->ModGetParty(base) == mod_system;
+}
+
+static bool parseIntMaybeHex(const std::string& text, unsigned long long& valueOut) {
+    if (text.empty()) {
+        return false;
+    }
+    int base = 10;
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+    } else {
+        for (char c : text) {
+            if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+                base = 16;
+                break;
+            }
+        }
+    }
+    try {
+        size_t idx = 0;
+        valueOut = std::stoull(text, &idx, base);
+        return idx == text.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parseAddressMaybeHex(const std::string& text, duint& valueOut) {
+    unsigned long long parsed = 0;
+    if (!parseIntMaybeHex(text, parsed)) {
+        return false;
+    }
+    valueOut = static_cast<duint>(parsed);
+    return true;
 }
 
 static size_t readSizeEnv(const char* name, size_t defaultValue, size_t minValue, size_t maxValue) {
@@ -186,6 +228,9 @@ static void loadServerConfigFromEnv() {
     g_maxQueueSize = readSizeEnv("X64DBG_HTTP_QUEUE", DEFAULT_MAX_QUEUE_SIZE, 8, 1024);
     g_maxRequestSize = readSizeEnv("X64DBG_HTTP_MAX_REQUEST", DEFAULT_MAX_REQUEST_SIZE, 8192, 8 * 1024 * 1024);
     g_maxExecQueue = readSizeEnv("X64DBG_EXEC_QUEUE", DEFAULT_MAX_EXEC_QUEUE, 1, 256);
+    g_maxExecJobs = readSizeEnv("X64DBG_EXEC_MAX_JOBS", DEFAULT_MAX_EXEC_JOBS, 16, 2048);
+    g_maxExecOutput = readSizeEnv("X64DBG_EXEC_MAX_OUTPUT", DEFAULT_MAX_EXEC_OUTPUT, 16 * 1024, 4 * 1024 * 1024);
+    g_execJobTtlMs = readSizeEnv("X64DBG_EXEC_TTL_MS", DEFAULT_EXEC_TTL_MS, 10 * 1000, 60ULL * 60ULL * 1000ULL);
 }
 
 static std::string jsonEscape(const std::string& input) {
@@ -292,6 +337,14 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
     return submitted;
 }
 
+static bool ensureDebugging(SOCKET clientSocket) {
+    if (!DbgIsDebugging()) {
+        sendHttpResponse(clientSocket, 409, "text/plain", "No active debug session");
+        return false;
+    }
+    return true;
+}
+
 static std::string makeExecJobId() {
     unsigned long long counter = g_execJobCounter.fetch_add(1);
     unsigned long long tick = GetTickCount64();
@@ -300,10 +353,18 @@ static std::string makeExecJobId() {
     return ss.str();
 }
 
+static void pruneExecJobsLocked(unsigned long long nowMs);
+
 static bool enqueueExecCommandJob(const std::string& cmd, std::string& jobIdOut, std::string& errorOut) {
     std::lock_guard<std::mutex> lock(g_execJobsMutex);
+    unsigned long long nowMs = GetTickCount64();
+    pruneExecJobsLocked(nowMs);
     if (g_execQueue.size() >= g_maxExecQueue) {
         errorOut = "Exec queue full";
+        return false;
+    }
+    if (g_execJobs.size() >= g_maxExecJobs) {
+        errorOut = "Exec job limit reached";
         return false;
     }
     std::string jobId = makeExecJobId();
@@ -311,6 +372,7 @@ static bool enqueueExecCommandJob(const std::string& cmd, std::string& jobIdOut,
     job.id = jobId;
     job.cmd = cmd;
     job.status = "queued";
+    job.createdAtMs = nowMs;
     g_execJobs.emplace(jobId, job);
     g_execQueue.push(jobId);
     g_execQueueCv.notify_one();
@@ -386,6 +448,15 @@ static void execCommandWorkerLoop() {
         if (output.empty()) {
             output = success ? "Command executed (no output)" : "Command failed";
         }
+        bool truncated = false;
+        if (output.size() > g_maxExecOutput) {
+            truncated = true;
+            const char* suffix = "\n...(truncated)";
+            size_t suffixLen = std::strlen(suffix);
+            size_t keep = g_maxExecOutput > suffixLen ? g_maxExecOutput - suffixLen : 0;
+            output.resize(keep);
+            output += suffix;
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_execJobsMutex);
@@ -397,6 +468,8 @@ static void execCommandWorkerLoop() {
             it->second.error = error;
             it->second.success = success;
             it->second.status = success ? "done" : "failed";
+            it->second.truncated = truncated;
+            it->second.finishedAtMs = GetTickCount64();
         }
     }
 }
@@ -423,6 +496,21 @@ static void stopExecCommandWorker() {
         g_execQueue.pop();
     }
     g_execJobs.clear();
+}
+
+static void pruneExecJobsLocked(unsigned long long nowMs) {
+    if (g_execJobs.empty()) {
+        return;
+    }
+    for (auto it = g_execJobs.begin(); it != g_execJobs.end(); ) {
+        const ExecCommandJob& job = it->second;
+        if (job.finishedAtMs > 0 && nowMs > job.finishedAtMs &&
+            nowMs - job.finishedAtMs > g_execJobTtlMs) {
+            it = g_execJobs.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 static bool addStepBatch(int count) {
@@ -536,7 +624,7 @@ bool startHttpServer() {
     std::lock_guard<std::mutex> lock(g_httpMutex);
     
     // Stop existing server if running
-    if (g_httpServerRunning) {
+    if (g_httpServerRunning.load()) {
         stopHttpServer();
     }
 
@@ -551,7 +639,7 @@ bool startHttpServer() {
         return false;
     }
     
-    g_httpServerRunning = true;
+    g_httpServerRunning.store(true);
     return true;
 }
 
@@ -559,8 +647,8 @@ bool startHttpServer() {
 void stopHttpServer() {
     std::lock_guard<std::mutex> lock(g_httpMutex);
     
-    if (g_httpServerRunning) {
-        g_httpServerRunning = false;
+    if (g_httpServerRunning.load()) {
+        g_httpServerRunning.store(false);
         g_queueCv.notify_all();
         stopExecCommandWorker();
         
@@ -587,6 +675,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
         _plugin_logprintf("WSAStartup failed with error: %d\n", result);
+        g_httpServerRunning.store(false);
+        stopExecCommandWorker();
         return 1;
     }
     
@@ -595,6 +685,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     if (g_serverSocket == INVALID_SOCKET) {
         _plugin_logprintf("Failed to create socket, error: %d\n", WSAGetLastError());
         WSACleanup();
+        g_httpServerRunning.store(false);
+        stopExecCommandWorker();
         return 1;
     }
     
@@ -609,6 +701,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         _plugin_logprintf("Bind failed with error: %d\n", WSAGetLastError());
         closesocket(g_serverSocket);
         WSACleanup();
+        g_httpServerRunning.store(false);
+        stopExecCommandWorker();
         return 1;
     }
     
@@ -617,12 +711,15 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         _plugin_logprintf("Listen failed with error: %d\n", WSAGetLastError());
         closesocket(g_serverSocket);
         WSACleanup();
+        g_httpServerRunning.store(false);
+        stopExecCommandWorker();
         return 1;
     }
     
     _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
-    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu\n",
-                      g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue);
+    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu\n",
+                      g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue,
+                      g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs);
     
     // Set socket to non-blocking mode
     u_long mode = 1;
@@ -636,7 +733,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     }
 
     // Main server loop
-    while (g_httpServerRunning) {
+    while (g_httpServerRunning.load()) {
         // Accept a client connection
         sockaddr_in clientAddr;
         int clientAddrSize = sizeof(clientAddr);
@@ -644,7 +741,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         
         if (clientSocket == INVALID_SOCKET) {
             // Check if we need to exit
-            if (!g_httpServerRunning) {
+            if (!g_httpServerRunning.load()) {
                 break;
             }
             
@@ -687,14 +784,14 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
 }
 
 void workerThreadLoop() {
-    while (g_httpServerRunning) {
+    while (g_httpServerRunning.load()) {
         SOCKET clientSocket = INVALID_SOCKET;
         {
             std::unique_lock<std::mutex> lock(g_queueMutex);
             g_queueCv.wait(lock, [] {
-                return !g_httpServerRunning || !g_socketQueue.empty();
+                return !g_httpServerRunning.load() || !g_socketQueue.empty();
             });
-            if (!g_httpServerRunning && g_socketQueue.empty()) {
+            if (!g_httpServerRunning.load() && g_socketQueue.empty()) {
                 return;
             }
             if (!g_socketQueue.empty()) {
@@ -715,6 +812,7 @@ void handleClientConnection(SOCKET clientSocket) {
         bool tooLarge = false;
         std::string requestData = readHttpRequest(clientSocket, &tooLarge);
         if (tooLarge) {
+            _plugin_logputs("HTTP request rejected: too large");
             sendHttpResponse(clientSocket, 413, "text/plain", "Request too large");
             break;
         }
@@ -790,6 +888,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     bool found = false;
                     {
                         std::lock_guard<std::mutex> lock(g_execJobsMutex);
+                        pruneExecJobsLocked(GetTickCount64());
                         auto it = g_execJobs.find(jobId);
                         if (it != g_execJobs.end()) {
                             job = it->second;
@@ -815,6 +914,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     if (!job.error.empty()) {
                         ss << ",\"error\":\"" << jsonEscape(job.error) << "\"";
+                    }
+                    if (job.truncated) {
+                        ss << ",\"truncated\":true";
                     }
                     ss << "}";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
@@ -940,13 +1042,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint value = 0;
-                    try {
-                        if (valueStr.substr(0, 2) == "0x") {
-                            value = std::stoull(valueStr.substr(2), nullptr, 16);
-                        } else {
-                            value = std::stoull(valueStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(valueStr, value)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid value format");
                         continue;
                     }
@@ -966,20 +1062,25 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     duint addr = 0;
                     duint size = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                        size = std::stoull(sizeStr, nullptr, 10);
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address or size format");
                         continue;
                     }
+
+                    unsigned long long sizeParsed = 0;
+                    if (!parseIntMaybeHex(sizeStr, sizeParsed)) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address or size format");
+                        continue;
+                    }
+                    size = static_cast<duint>(sizeParsed);
                     
                     if (size > 1024 * 1024) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Size too large");
+                        continue;
+                    }
+
+                    if (!Script::Memory::IsValidPtr(addr)) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid memory address");
                         continue;
                     }
                     
@@ -987,7 +1088,10 @@ void handleClientConnection(SOCKET clientSocket) {
                     duint sizeRead = 0;
                     
                     if (!Script::Memory::Read(addr, buffer.data(), size, &sizeRead)) {
-                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to read memory");
+                        unsigned int protect = Script::Memory::GetProtect(addr);
+                        std::stringstream err;
+                        err << "Failed to read memory (protect=0x" << std::hex << protect << ")";
+                        sendHttpResponse(clientSocket, 500, "text/plain", err.str());
                         continue;
                     }
                     
@@ -1008,13 +1112,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1045,13 +1143,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1067,13 +1159,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1088,11 +1174,17 @@ void handleClientConnection(SOCKET clientSocket) {
                 // DEBUG API ENDPOINTS
                 // =============================================================================
                 else if (path == "/Debug/Run") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     bool submitted = DbgCmdExec("run");
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug run queued" : "Failed to queue debug run");
                 }
                 else if (path == "/Debug/RunUntilUserCode") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     std::string autoStr = queryParams["autoResume"];
                     bool autoResume = ParseBool(autoStr, true);
 
@@ -1101,6 +1193,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                 }
                 else if (path == "/Debug/CancelRunUntilUserCode") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
                         Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
                     }
@@ -1108,21 +1203,33 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", "Run-until-user-code canceled");
                 }
                 else if (path == "/Debug/Restart") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     bool submitted = DbgCmdExec("restart");
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug restart queued" : "Failed to queue debug restart");
                 }
                 else if (path == "/Debug/Pause") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     cancelRunUntilUserCodeIfActive();
                     bool submitted = DbgCmdExec("pause");
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug pause queued" : "Failed to queue debug pause");
                 }
                 else if (path == "/Debug/Stop") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     Script::Debug::Stop();
                     sendHttpResponse(clientSocket, 200, "text/plain", "Debug stop executed");
                 }
                 else if (path == "/Debug/StepIn") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     cancelRunUntilUserCodeIfActive();
                     if (DbgIsRunning()) {
                         sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
@@ -1133,6 +1240,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         queued ? "Step in queued" : "Step in busy");
                 }
                 else if (path == "/Debug/StepOver") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     cancelRunUntilUserCodeIfActive();
                     if (DbgIsRunning()) {
                         sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
@@ -1143,6 +1253,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         queued ? "Step over queued" : "Step over busy");
                 }
                 else if (path == "/Debug/StepOverN") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     cancelRunUntilUserCodeIfActive();
                     if (DbgIsRunning()) {
                         sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
@@ -1151,10 +1264,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string countStr = queryParams["count"];
                     int count = 0;
                     if (!countStr.empty()) {
-                        try {
-                            count = std::stoi(countStr);
-                        } catch (...) {
-                            count = 0;
+                        unsigned long long parsed = 0;
+                        if (parseIntMaybeHex(countStr, parsed)) {
+                            count = static_cast<int>(parsed);
                         }
                     }
                     if (count <= 0) {
@@ -1166,10 +1278,16 @@ void handleClientConnection(SOCKET clientSocket) {
                         started ? "Step over batch queued" : "Step over busy");
                 }
                 else if (path == "/Debug/CancelStepBatch") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     stopStepBatch();
                     sendHttpResponse(clientSocket, 200, "text/plain", "Step batch canceled");
                 }
                 else if (path == "/Debug/StepOut") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     cancelRunUntilUserCodeIfActive();
                     if (DbgIsRunning()) {
                         sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
@@ -1180,6 +1298,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         queued ? "Step out queued" : "Step out busy");
                 }
                 else if (path == "/Debug/SetBreakpoint") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     std::string addrStr = queryParams["addr"];
                     if (addrStr.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing address parameter");
@@ -1187,13 +1308,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1203,6 +1318,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         success ? "Breakpoint set successfully" : "Failed to set breakpoint");
                 }
                 else if (path == "/Debug/DeleteBreakpoint") {
+                    if (!ensureDebugging(clientSocket)) {
+                        continue;
+                    }
                     std::string addrStr = queryParams["addr"];
                     if (addrStr.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing address parameter");
@@ -1210,13 +1328,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1282,13 +1394,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1322,13 +1428,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1351,13 +1451,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint value = 0;
-                    try {
-                        if (valueStr.substr(0, 2) == "0x") {
-                            value = std::stoull(valueStr.substr(2), nullptr, 16);
-                        } else {
-                            value = std::stoull(valueStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(valueStr, value)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid value format");
                         continue;
                     }
@@ -1371,12 +1465,12 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string offsetStr = queryParams["offset"];
                     int offset = 0;
                     if (!offsetStr.empty()) {
-                        try {
-                            offset = std::stoi(offsetStr);
-                        } catch (const std::exception& e) {
+                        unsigned long long parsed = 0;
+                        if (!parseIntMaybeHex(offsetStr, parsed)) {
                             sendHttpResponse(clientSocket, 400, "text/plain", "Invalid offset format");
                             continue;
                         }
+                        offset = static_cast<int>(parsed);
                     }
                     
                     duint value = Script::Stack::Peek(offset);
@@ -1392,13 +1486,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint addr = 0;
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1429,19 +1517,18 @@ void handleClientConnection(SOCKET clientSocket) {
                     duint addr = 0;
                     int count = 1;
                     
-                    try {
-                        if (addrStr.substr(0, 2) == "0x") {
-                            addr = std::stoull(addrStr.substr(2), nullptr, 16);
-                        } else {
-                            addr = std::stoull(addrStr, nullptr, 16);
-                        }
-                        
-                        if (!countStr.empty()) {
-                            count = std::stoi(countStr);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address or count format");
                         continue;
+                    }
+                    if (!countStr.empty()) {
+                        unsigned long long parsed = 0;
+                        if (parseIntMaybeHex(countStr, parsed)) {
+                            count = static_cast<int>(parsed);
+                        } else {
+                            sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address or count format");
+                            continue;
+                        }
                     }
                     
                     if (count <= 0 || count > 100) {
@@ -1585,19 +1672,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     duint start = 0, size = 0;
 
-                    
-                    try {
-                        if (startStr.substr(0, 2) == "0x") {
-                            start = std::stoull(startStr.substr(2), nullptr, 16);
-                        } else {
-                            start = std::stoull(startStr, nullptr, 16);
-                        }
-                        if (sizeStr.substr(0, 2) == "0x") {
-                            size = std::stoull(sizeStr.substr(2), nullptr, 16);
-                        } else {
-                            size = std::stoull(sizeStr, nullptr, 16);
-                        }
-                    } catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(startStr, start)) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid start or size format");
+                        continue;
+                    }
+                    if (!parseAddressMaybeHex(sizeStr, size)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid start or size format");
                         continue;
                     }
@@ -1660,10 +1739,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     _plugin_logprintf("MemoryBase endpoint called with addr: %s\n", addrStr.c_str());
                     // Convert string address to duint
                     duint addr = 0;
-                    try {
-                        addr = std::stoull(addrStr, nullptr, 16); // Parse as hex
-                    }
-                    catch (const std::exception& e) {
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
@@ -1901,7 +1977,7 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
 
 // Command callback for toggling HTTP server
 bool cbEnableHttpServer(int argc, char* argv[]) {
-    if (g_httpServerRunning) {
+    if (g_httpServerRunning.load()) {
         _plugin_logputs("Stopping HTTP server...");
         stopHttpServer();
         _plugin_logputs("HTTP server stopped");
@@ -1939,7 +2015,7 @@ bool cbSetHttpPort(int argc, char* argv[]) {
     
     g_httpPort = port;
     
-    if (g_httpServerRunning) {
+    if (g_httpServerRunning.load()) {
         _plugin_logputs("Restarting HTTP server with new port...");
         stopHttpServer();
         if (startHttpServer()) {

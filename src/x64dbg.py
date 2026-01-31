@@ -63,13 +63,14 @@ def safe_get(endpoint: str, params: dict = None):
         response = requests.get(url, params=params, timeout=DEFAULT_REQUEST_TIMEOUT_SEC)
         response.encoding = 'utf-8'
         if response.ok:
-            # Try to parse as JSON first
-            try:
-                return response.json()
-            except ValueError:
-                return response.text.strip()
-        else:
-            return f"Error {response.status_code}: {response.text.strip()}"
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "application/json" in content_type:
+                try:
+                    return response.json()
+                except ValueError:
+                    return response.text.strip()
+            return response.text.strip()
+        return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
         return f"Request failed: {str(e)}"
 
@@ -86,15 +87,15 @@ def safe_post(endpoint: str, data: dict | str):
             response = requests.post(url, data=data.encode("utf-8"), timeout=DEFAULT_REQUEST_TIMEOUT_SEC)
         
         response.encoding = 'utf-8'
-        
         if response.ok:
-            # Try to parse as JSON first
-            try:
-                return response.json()
-            except ValueError:
-                return response.text.strip()
-        else:
-            return f"Error {response.status_code}: {response.text.strip()}"
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "application/json" in content_type:
+                try:
+                    return response.json()
+                except ValueError:
+                    return response.text.strip()
+            return response.text.strip()
+        return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
         return f"Request failed: {str(e)}"
 
@@ -407,7 +408,12 @@ def MemoryRead(addr: str, size: str) -> str:
     Returns:
         Hexadecimal string representing the memory contents
     """
-    return safe_get("Memory/Read", {"addr": addr, "size": size})
+    result = safe_get("Memory/Read", {"addr": addr, "size": size})
+    if isinstance(result, str):
+        return result
+    if isinstance(result, int):
+        return f"{result:x}"
+    return str(result)
 
 @mcp.tool()
 def MemoryWrite(addr: str, data: str) -> str:
