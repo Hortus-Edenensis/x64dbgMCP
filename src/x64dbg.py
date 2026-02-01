@@ -107,6 +107,69 @@ def _is_error_response(result: Any) -> bool:
         return lower.startswith("error") or lower.startswith("request failed")
     return False
 
+def _split_csv(text: str) -> List[str]:
+    if not text:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+def _parse_memory_spec(text: str) -> List[Dict[str, str]]:
+    items = _split_csv(text)
+    result = []
+    for item in items:
+        if ":" not in item:
+            continue
+        addr, size = item.split(":", 1)
+        addr = addr.strip()
+        size = size.strip()
+        if addr and size:
+            result.append({"addr": addr, "size": size})
+    return result
+
+def _get_is_running() -> tuple[bool | None, str | None]:
+    res = safe_get("IsDebugActive")
+    if isinstance(res, dict) and "isRunning" in res:
+        return bool(res["isRunning"]), None
+    if isinstance(res, dict) and "error" in res:
+        return None, str(res["error"])
+    if isinstance(res, str) and _is_error_response(res):
+        return None, res
+    return None, "Unexpected IsDebugActive response"
+
+def _get_is_debugging() -> tuple[bool | None, str | None]:
+    res = safe_get("Is_Debugging")
+    if isinstance(res, dict) and "isDebugging" in res:
+        return bool(res["isDebugging"]), None
+    if isinstance(res, dict) and "error" in res:
+        return None, str(res["error"])
+    if isinstance(res, str) and _is_error_response(res):
+        return None, res
+    return None, "Unexpected IsDebugging response"
+
+def _capture_state(registers: List[str], memory_specs: List[Dict[str, str]], capture_ip: bool) -> Dict[str, Any]:
+    state: Dict[str, Any] = {"registers": {}, "memory": []}
+
+    regs = list(registers)
+    if capture_ip:
+        if "rip" not in regs and "eip" not in regs:
+            regs.insert(0, "rip")
+
+    for reg in regs:
+        value = safe_get("Register/Get", {"register": reg})
+        state["registers"][reg] = value
+        if reg == "rip" and isinstance(value, str) and value.lower().startswith("unknown"):
+            value = safe_get("Register/Get", {"register": "eip"})
+            state["registers"]["eip"] = value
+
+    for spec in memory_specs:
+        addr = spec.get("addr", "")
+        size = spec.get("size", "")
+        if not addr or not size:
+            continue
+        data = safe_get("Memory/ReadDetailed", {"addr": addr, "size": size})
+        state["memory"].append({"addr": addr, "size": size, "data": data})
+
+    return state
+
 def _normalize_windows_path(path: str) -> str:
     if not path:
         return ""
@@ -309,6 +372,112 @@ def ExecCommandResult(job_id: str, consume: bool = False) -> Any:
     if consume:
         params["consume"] = "1"
     return safe_get("ExecCommand/Result", params)
+
+@mcp.tool()
+def CommandRun(cmd: str,
+               wait: bool = False,
+               dry_run: bool = False,
+               require_confirm: bool = False,
+               confirm: bool = False,
+               ensure_paused: bool = False,
+               auto_pause: bool = False,
+               capture_before: bool = False,
+               capture_after: bool = False,
+               capture_ip: bool = True,
+               registers: str = "",
+               memory: str = "") -> Dict[str, Any]:
+    """
+    Safe command execution wrapper with optional dry-run, confirmation, and snapshots.
+
+    Parameters:
+        cmd: Command to execute
+        wait: Wait for command completion
+        dry_run: Only return plan, do not execute
+        require_confirm: Require confirm=True to execute
+        confirm: Confirmation flag
+        ensure_paused: Ensure debugger is paused before execution
+        auto_pause: Attempt to pause if running
+        capture_before: Capture state before execution
+        capture_after: Capture state after execution
+        capture_ip: Include instruction pointer in snapshot
+        registers: Comma-separated register names to capture
+        memory: Comma-separated memory specs: "addr:size"
+
+    Returns:
+        Structured result with output and snapshots
+    """
+    result: Dict[str, Any] = {"cmd": cmd, "executed": False}
+
+    if not cmd:
+        result["error"] = "Missing command"
+        return result
+
+    is_debugging, dbg_err = _get_is_debugging()
+    if is_debugging is False:
+        result["error"] = "No active debug session"
+        return result
+    if dbg_err:
+        result["error"] = dbg_err
+        return result
+
+    if ensure_paused:
+        is_running, run_err = _get_is_running()
+        if run_err:
+            result["error"] = run_err
+            return result
+        if is_running:
+            if auto_pause:
+                safe_get("Debug/Pause")
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    is_running, run_err = _get_is_running()
+                    if run_err:
+                        break
+                    if not is_running:
+                        break
+                    time.sleep(0.05)
+            else:
+                result["error"] = "Debugger is running; pause required"
+                return result
+
+            is_running, run_err = _get_is_running()
+            if run_err:
+                result["error"] = run_err
+                return result
+            if is_running:
+                result["error"] = "Failed to pause debugger"
+                return result
+
+    regs_list = _split_csv(registers)
+    mem_list = _parse_memory_spec(memory)
+
+    if capture_before:
+        result["before"] = _capture_state(regs_list, mem_list, capture_ip)
+
+    if dry_run:
+        result["dry_run"] = True
+        result["rollback_plan"] = result.get("before")
+        return result
+
+    if require_confirm and not confirm:
+        result["error"] = "Confirmation required"
+        result["rollback_plan"] = result.get("before")
+        return result
+
+    output = ExecCommand(cmd=cmd, wait=wait)
+    result["output"] = output
+    if _is_error_response(output):
+        result["error"] = output
+        return result
+
+    result["executed"] = True
+
+    if capture_after:
+        result["after"] = _capture_state(regs_list, mem_list, capture_ip)
+    if capture_before:
+        result["rollback_plan"] = result.get("before")
+
+    return result
 
 # =============================================================================
 # DEBUGGING STATUS

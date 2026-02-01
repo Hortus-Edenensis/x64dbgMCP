@@ -772,6 +772,7 @@ void stopHttpServer() {
         
         // Close the server socket to unblock any accept calls
         if (g_serverSocket != INVALID_SOCKET) {
+            shutdown(g_serverSocket, SD_BOTH);
             closesocket(g_serverSocket);
             g_serverSocket = INVALID_SOCKET;
         }
