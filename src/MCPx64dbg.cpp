@@ -87,6 +87,7 @@ static const size_t DEFAULT_MAX_EXEC_JOBS = 128;
 static const size_t DEFAULT_MAX_EXEC_OUTPUT = 256 * 1024;
 static const unsigned long long DEFAULT_EXEC_TTL_MS = 5ULL * 60ULL * 1000ULL;
 static const bool DEFAULT_EXEC_REDIRECT = true;
+static const bool DEFAULT_EXEC_DIRECT = true;
 
 // Global variables
 int g_pluginHandle;
@@ -100,6 +101,7 @@ std::condition_variable g_queueCv;
 std::queue<SOCKET> g_socketQueue;
 std::vector<std::thread> g_workerThreads;
 std::mutex g_execCommandMutex;
+std::mutex g_dbgApiMutex;
 size_t g_maxRequestSize = DEFAULT_MAX_REQUEST_SIZE;
 size_t g_maxQueueSize = DEFAULT_MAX_QUEUE_SIZE;
 int g_workerCount = DEFAULT_WORKER_COUNT;
@@ -108,6 +110,7 @@ size_t g_maxExecJobs = DEFAULT_MAX_EXEC_JOBS;
 size_t g_maxExecOutput = DEFAULT_MAX_EXEC_OUTPUT;
 unsigned long long g_execJobTtlMs = DEFAULT_EXEC_TTL_MS;
 bool g_execRedirectEnabled = DEFAULT_EXEC_REDIRECT;
+bool g_execDirectEnabled = DEFAULT_EXEC_DIRECT;
 
 struct ExecCommandJob {
     std::string id;
@@ -211,6 +214,62 @@ static bool sanitizeHexBytes(const std::string& input, std::string& output) {
     return (output.size() % 2) == 0;
 }
 
+static bool readMemoryHex(duint addr, duint size, std::string& hexOut, duint& sizeRead, std::string& errorOut) {
+    hexOut.clear();
+    errorOut.clear();
+    sizeRead = 0;
+
+    if (!Script::Memory::IsValidPtr(addr)) {
+        errorOut = "Invalid memory address";
+        return false;
+    }
+
+    std::vector<unsigned char> buffer(size);
+    duint initialRead = 0;
+    bool fullRead = Script::Memory::Read(addr, buffer.data(), size, &initialRead);
+    sizeRead = initialRead;
+
+    if (!fullRead || sizeRead != size) {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        size_t pageSize = sysInfo.dwPageSize ? sysInfo.dwPageSize : 0x1000;
+        duint remaining = size;
+        duint totalRead = 0;
+        duint cursor = addr;
+        while (remaining > 0) {
+            size_t pageOffset = static_cast<size_t>(cursor % pageSize);
+            duint chunk = static_cast<duint>(std::min<unsigned long long>(remaining, pageSize - pageOffset));
+            duint chunkRead = 0;
+            if (!Script::Memory::Read(cursor, buffer.data() + totalRead, chunk, &chunkRead) || chunkRead == 0) {
+                break;
+            }
+            totalRead += chunkRead;
+            cursor += chunkRead;
+            remaining -= chunkRead;
+            if (chunkRead < chunk) {
+                break;
+            }
+        }
+
+        sizeRead = totalRead;
+    }
+
+    if (sizeRead == 0) {
+        unsigned int protect = Script::Memory::GetProtect(addr);
+        std::stringstream err;
+        err << "Failed to read memory (protect=0x" << std::hex << protect << ")";
+        errorOut = err.str();
+        return false;
+    }
+
+    std::stringstream ss;
+    for (duint i = 0; i < sizeRead; i++) {
+        ss << std::setw(2) << std::setfill('0') << std::hex << (int)buffer[i];
+    }
+    hexOut = ss.str();
+    return true;
+}
+
 static size_t readSizeEnv(const char* name, size_t defaultValue, size_t minValue, size_t maxValue) {
     const char* raw = std::getenv(name);
     if (!raw || !*raw) {
@@ -268,6 +327,7 @@ static void loadServerConfigFromEnv() {
     g_maxExecOutput = readSizeEnv("X64DBG_EXEC_MAX_OUTPUT", DEFAULT_MAX_EXEC_OUTPUT, 16 * 1024, 4 * 1024 * 1024);
     g_execJobTtlMs = readSizeEnv("X64DBG_EXEC_TTL_MS", DEFAULT_EXEC_TTL_MS, 10 * 1000, 60ULL * 60ULL * 1000ULL);
     g_execRedirectEnabled = readBoolEnv("X64DBG_EXEC_REDIRECT", DEFAULT_EXEC_REDIRECT);
+    g_execDirectEnabled = readBoolEnv("X64DBG_EXEC_DIRECT", DEFAULT_EXEC_DIRECT);
 }
 
 static std::string jsonEscape(const std::string& input) {
@@ -459,7 +519,15 @@ static void execCommandWorkerLoop() {
         bool success = false;
 
         if (!g_execRedirectEnabled) {
-            success = DbgCmdExecDirect(cmd.c_str());
+            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+            if (g_execDirectEnabled) {
+                success = DbgCmdExecDirect(cmd.c_str());
+            } else {
+                success = DbgCmdExec(cmd.c_str());
+            }
+            if (!g_execDirectEnabled && output.empty()) {
+                output = success ? "Command queued (direct disabled)" : "Failed to queue command";
+            }
         } else {
             char tempPath[MAX_PATH];
             GetTempPathA(MAX_PATH, tempPath);
@@ -470,8 +538,13 @@ static void execCommandWorkerLoop() {
                 std::string logFile = tempFile;
                 {
                     std::lock_guard<std::mutex> execLock(g_execCommandMutex);
+                    std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                     GuiLogRedirect(logFile.c_str());
-                    success = DbgCmdExecDirect(cmd.c_str());
+                    if (g_execDirectEnabled) {
+                        success = DbgCmdExecDirect(cmd.c_str());
+                    } else {
+                        success = DbgCmdExec(cmd.c_str());
+                    }
                     GuiFlushLog();
                     Sleep(200);
                     GuiLogRedirectStop();
@@ -762,9 +835,11 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     }
     
     _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
-    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s\n",
+    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s exec_direct=%s\n",
                       g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue,
-                      g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs, g_execRedirectEnabled ? "true" : "false");
+                      g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs,
+                      g_execRedirectEnabled ? "true" : "false",
+                      g_execDirectEnabled ? "true" : "false");
     
     // Start worker threads
     g_workerThreads.clear();
@@ -863,6 +938,10 @@ void handleClientConnection(SOCKET clientSocket) {
 
             // Handle different endpoints
             try {
+                std::unique_lock<std::mutex> dbgLock(g_dbgApiMutex, std::defer_lock);
+                if (path != "/ExecCommand/Result") {
+                    dbgLock.lock();
+                }
                 // Unified command execution endpoint
                 if (path == "/ExecCommand") {
                     std::string cmd = queryParams["cmd"];
@@ -1113,53 +1192,67 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
 
-                    if (!Script::Memory::IsValidPtr(addr)) {
-                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid memory address");
+                    std::string hexOut;
+                    std::string errorOut;
+                    duint sizeRead = 0;
+                    if (!readMemoryHex(addr, size, hexOut, sizeRead, errorOut)) {
+                        if (errorOut == "Invalid memory address") {
+                            sendHttpResponse(clientSocket, 400, "text/plain", errorOut);
+                        } else {
+                            sendHttpResponse(clientSocket, 500, "text/plain", errorOut);
+                        }
+                        continue;
+                    }
+
+                    int status = (sizeRead == size) ? 200 : 206;
+                    sendHttpResponse(clientSocket, status, "text/plain", hexOut);
+                }
+                else if (path == "/Memory/ReadDetailed") {
+                    std::string addrStr = queryParams["addr"];
+                    std::string sizeStr = queryParams["size"];
+                    
+                    if (addrStr.empty() || sizeStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json", "{\"error\":\"Missing address or size\"}");
                         continue;
                     }
                     
-                    std::vector<unsigned char> buffer(size);
-                    duint sizeRead = 0;
-                    bool fullRead = Script::Memory::Read(addr, buffer.data(), size, &sizeRead);
-                    if (!fullRead || sizeRead != size) {
-                        SYSTEM_INFO sysInfo;
-                        GetSystemInfo(&sysInfo);
-                        size_t pageSize = sysInfo.dwPageSize ? sysInfo.dwPageSize : 0x1000;
-                        duint remaining = size;
-                        duint totalRead = 0;
-                        duint cursor = addr;
-                        while (remaining > 0) {
-                            size_t pageOffset = static_cast<size_t>(cursor % pageSize);
-                            duint chunk = static_cast<duint>(std::min<unsigned long long>(remaining, pageSize - pageOffset));
-                            duint chunkRead = 0;
-                            if (!Script::Memory::Read(cursor, buffer.data() + totalRead, chunk, &chunkRead) || chunkRead == 0) {
-                                break;
-                            }
-                            totalRead += chunkRead;
-                            cursor += chunkRead;
-                            remaining -= chunkRead;
-                            if (chunkRead < chunk) {
-                                break;
-                            }
-                        }
+                    duint addr = 0;
+                    duint size = 0;
+                    if (!parseAddressMaybeHex(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json", "{\"error\":\"Invalid address or size format\"}");
+                        continue;
+                    }
+                    unsigned long long sizeParsed = 0;
+                    if (!parseIntMaybeHex(sizeStr, sizeParsed)) {
+                        sendHttpResponse(clientSocket, 400, "application/json", "{\"error\":\"Invalid address or size format\"}");
+                        continue;
+                    }
+                    size = static_cast<duint>(sizeParsed);
+                    
+                    if (size > 1024 * 1024) {
+                        sendHttpResponse(clientSocket, 400, "application/json", "{\"error\":\"Size too large\"}");
+                        continue;
+                    }
 
-                        sizeRead = totalRead;
-                        if (sizeRead == 0) {
-                            unsigned int protect = Script::Memory::GetProtect(addr);
-                            std::stringstream err;
-                            err << "Failed to read memory (protect=0x" << std::hex << protect << ")";
-                            sendHttpResponse(clientSocket, 500, "text/plain", err.str());
-                            continue;
-                        }
+                    std::string hexOut;
+                    std::string errorOut;
+                    duint sizeRead = 0;
+                    if (!readMemoryHex(addr, size, hexOut, sizeRead, errorOut)) {
+                        std::stringstream err;
+                        err << "{\"error\":\"" << jsonEscape(errorOut) << "\"}";
+                        sendHttpResponse(clientSocket, errorOut == "Invalid memory address" ? 400 : 500,
+                                         "application/json", err.str());
+                        continue;
                     }
-                    
+
+                    bool partial = sizeRead != size;
                     std::stringstream ss;
-                    for (duint i = 0; i < sizeRead; i++) {
-                        ss << std::setw(2) << std::setfill('0') << std::hex << (int)buffer[i];
-                    }
-                    
-                    int status = (sizeRead == size) ? 200 : 206;
-                    sendHttpResponse(clientSocket, status, "text/plain", ss.str());
+                    ss << "{";
+                    ss << "\"data\":\"" << jsonEscape(hexOut) << "\",";
+                    ss << "\"bytes\":" << sizeRead << ",";
+                    ss << "\"partial\":" << (partial ? "true" : "false");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, partial ? 206 : 200, "application/json", ss.str());
                 }
                 else if (path == "/Memory/Write") {
                     std::string addrStr = queryParams["addr"];

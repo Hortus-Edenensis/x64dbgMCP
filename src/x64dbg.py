@@ -416,6 +416,20 @@ def MemoryRead(addr: str, size: str) -> str:
     return str(result)
 
 @mcp.tool()
+def MemoryReadDetailed(addr: str, size: str) -> Any:
+    """
+    Read memory and return detailed metadata (partial reads, bytes count)
+
+    Parameters:
+        addr: Memory address (in hex format, e.g. "0x1000")
+        size: Number of bytes to read
+
+    Returns:
+        JSON with data/bytes/partial or error
+    """
+    return safe_get("Memory/ReadDetailed", {"addr": addr, "size": size})
+
+@mcp.tool()
 def MemoryWrite(addr: str, data: str) -> str:
     """
     Write memory using enhanced Script API
