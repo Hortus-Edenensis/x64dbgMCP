@@ -378,6 +378,7 @@ static void cancelRunUntilUserCodeIfActive() {
         return;
     }
     if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
+        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
         Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
     }
     clearRunUntilUserCodeState();
@@ -449,7 +450,12 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
 
 static bool ensureDebugging(SOCKET clientSocket) {
-    if (!DbgIsDebugging()) {
+    bool debugging = false;
+    {
+        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+        debugging = DbgIsDebugging();
+    }
+    if (!debugging) {
         sendHttpResponse(clientSocket, 409, "text/plain", "No active debug session");
         return false;
     }
@@ -478,6 +484,36 @@ static bool ensureConfirmed(SOCKET clientSocket,
         return false;
     }
     return true;
+}
+
+static bool isExecCommandSafeReadOnly(const std::string& cmd) {
+    std::string trimmed = cmd;
+    trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(),
+                                               [](unsigned char c) { return !std::isspace(c); }));
+    if (trimmed.empty()) {
+        return false;
+    }
+    std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
+    std::istringstream iss(trimmed);
+    std::string first;
+    iss >> first;
+    if (first.empty()) {
+        return false;
+    }
+    static const std::unordered_set<std::string> kReadOnly = {
+        "help", "?", "eip", "rip", "cip", "csp", "cax", "cbp",
+        "rtr", "script", "sc", "getcmdline", "getthreadid",
+        "mod", "modinfo", "modbase", "modlist", "modulelist",
+        "sym", "symfind", "symaddr", "symname",
+        "eval", "print", "printf", "dump", "db", "dw", "dd", "dq",
+        "disasm", "dis", "disasmaddr",
+        "ref", "refget", "reffind",
+        "memlist", "memmap", "meminfo", "memdump",
+        "commentlist", "labelist", "bookmarklist",
+        "stack", "threads", "threadlist",
+        "bp", "bplist"
+    };
+    return kReadOnly.find(first) != kReadOnly.end();
 }
 
 static std::string makeExecJobId() {
@@ -704,6 +740,7 @@ static bool enqueueDbgTask(const std::function<void()>& task) {
     }
     std::lock_guard<std::mutex> lock(g_dbgTaskMutex);
     if (g_dbgTaskQueue.size() >= g_dbgTaskQueueMax) {
+        _plugin_logputs("Dbg task queue full; dropping task");
         return false;
     }
     g_dbgTaskQueue.push(task);
@@ -1044,15 +1081,8 @@ void handleClientConnection(SOCKET clientSocket) {
 
             // Handle different endpoints
             try {
-                std::unique_lock<std::mutex> dbgLock(g_dbgApiMutex, std::defer_lock);
-                if (path != "/ExecCommand/Result") {
-                    dbgLock.lock();
-                }
                 // Unified command execution endpoint
                 if (path == "/ExecCommand") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "ExecCommand")) {
-                        continue;
-                    }
                     std::string cmd = queryParams["cmd"];
                     if (cmd.empty() && !body.empty()) {
                         cmd = body;
@@ -1066,17 +1096,31 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
 
+                    if (g_safeModeEnabled && !isExecCommandSafeReadOnly(cmd)) {
+                        if (!ensureConfirmed(clientSocket, queryParams, "ExecCommand")) {
+                            continue;
+                        }
+                    }
+
                     std::string cmdLower = cmd;
                     std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
                     if (cmdLower == "runtousercode" || cmdLower == "runuser" || cmdLower == "runto user code") {
                         std::string jsonOut;
-                        bool ok = startRunUntilUserCode(jsonOut, true);
+                        bool ok = false;
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            ok = startRunUntilUserCode(jsonOut, true);
+                        }
                         sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                         continue;
                     }
 
                     if (!wait) {
-                        bool submitted = DbgCmdExec(cmd.c_str());
+                        bool submitted = false;
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            submitted = DbgCmdExec(cmd.c_str());
+                        }
                         sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                             submitted ? "Command queued" : "Failed to queue command");
                         continue;
@@ -1144,6 +1188,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/IsDebugActive") {
+                    std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                     bool isRunning = DbgIsRunning();
                     _plugin_logprintf("DbgIsRunning() called, result: %s\n", isRunning ? "true" : "false");
                     std::stringstream ss;
@@ -1151,6 +1196,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Is_Debugging") {
+                    std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                     bool isDebugging = DbgIsDebugging();
                     _plugin_logprintf("DbgIsDebugging() called, result: %s\n", isDebugging ? "true" : "false");
                     std::stringstream ss;
@@ -1209,7 +1255,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    duint value = Script::Register::Get(reg);
+                    duint value = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        value = Script::Register::Get(reg);
+                    }
                     std::stringstream ss;
                     ss << "0x" << std::hex << value;
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
@@ -1272,7 +1322,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    bool success = Script::Register::Set(reg, value);
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Register::Set(reg, value);
+                    }
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Register set successfully" : "Failed to set register");
                 }
@@ -1307,13 +1361,16 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string hexOut;
                     std::string errorOut;
                     duint sizeRead = 0;
-                    if (!readMemoryHex(addr, size, hexOut, sizeRead, errorOut)) {
-                        if (errorOut == "Invalid memory address") {
-                            sendHttpResponse(clientSocket, 400, "text/plain", errorOut);
-                        } else {
-                            sendHttpResponse(clientSocket, 500, "text/plain", errorOut);
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (!readMemoryHex(addr, size, hexOut, sizeRead, errorOut)) {
+                            if (errorOut == "Invalid memory address") {
+                                sendHttpResponse(clientSocket, 400, "text/plain", errorOut);
+                            } else {
+                                sendHttpResponse(clientSocket, 500, "text/plain", errorOut);
+                            }
+                            continue;
                         }
-                        continue;
                     }
 
                     int status = (sizeRead == size) ? 200 : 206;
@@ -1349,12 +1406,15 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string hexOut;
                     std::string errorOut;
                     duint sizeRead = 0;
-                    if (!readMemoryHex(addr, size, hexOut, sizeRead, errorOut)) {
-                        std::stringstream err;
-                        err << "{\"error\":\"" << jsonEscape(errorOut) << "\"}";
-                        sendHttpResponse(clientSocket, errorOut == "Invalid memory address" ? 400 : 500,
-                                         "application/json", err.str());
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (!readMemoryHex(addr, size, hexOut, sizeRead, errorOut)) {
+                            std::stringstream err;
+                            err << "{\"error\":\"" << jsonEscape(errorOut) << "\"}";
+                            sendHttpResponse(clientSocket, errorOut == "Invalid memory address" ? 400 : 500,
+                                             "application/json", err.str());
+                            continue;
+                        }
                     }
 
                     bool partial = sizeRead != size;
@@ -1404,7 +1464,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint sizeWritten = 0;
-                    bool success = Script::Memory::Write(addr, buffer.data(), buffer.size(), &sizeWritten);
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Memory::Write(addr, buffer.data(), buffer.size(), &sizeWritten);
+                    }
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Memory written successfully" : "Failed to write memory");
                 }
@@ -1421,7 +1485,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    bool isValid = Script::Memory::IsValidPtr(addr);
+                    bool isValid = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        isValid = Script::Memory::IsValidPtr(addr);
+                    }
                     sendHttpResponse(clientSocket, 200, "text/plain", isValid ? "true" : "false");
                 }
                 else if (path == "/Memory/GetProtect") {
@@ -1437,7 +1505,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    unsigned int protect = Script::Memory::GetProtect(addr);
+                    unsigned int protect = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        protect = Script::Memory::GetProtect(addr);
+                    }
                     std::stringstream ss;
                     ss << "0x" << std::hex << protect;
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
@@ -1450,7 +1522,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
-                    bool submitted = DbgCmdExec("run");
+                    bool submitted = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        submitted = DbgCmdExec("run");
+                    }
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug run queued" : "Failed to queue debug run");
                 }
@@ -1462,7 +1538,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     bool autoResume = ParseBool(autoStr, true);
 
                     std::string jsonOut;
-                    bool ok = startRunUntilUserCode(jsonOut, autoResume);
+                    bool ok = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        ok = startRunUntilUserCode(jsonOut, autoResume);
+                    }
                     sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
                 }
                 else if (path == "/Debug/CancelRunUntilUserCode") {
@@ -1470,6 +1550,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
                     }
                     clearRunUntilUserCodeState();
@@ -1479,7 +1560,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
-                    bool submitted = DbgCmdExec("restart");
+                    bool submitted = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        submitted = DbgCmdExec("restart");
+                    }
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug restart queued" : "Failed to queue debug restart");
                 }
@@ -1488,7 +1573,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
-                    bool submitted = DbgCmdExec("pause");
+                    bool submitted = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        submitted = DbgCmdExec("pause");
+                    }
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug pause queued" : "Failed to queue debug pause");
                 }
@@ -1499,7 +1588,10 @@ void handleClientConnection(SOCKET clientSocket) {
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
-                    Script::Debug::Stop();
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        Script::Debug::Stop();
+                    }
                     sendHttpResponse(clientSocket, 200, "text/plain", "Debug stop executed");
                 }
                 else if (path == "/Debug/StepIn") {
@@ -1507,11 +1599,18 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
-                    if (DbgIsRunning()) {
-                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (DbgIsRunning()) {
+                            sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                            continue;
+                        }
                     }
-                    bool queued = queueDebugStepCommand("sti");
+                    bool queued = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        queued = queueDebugStepCommand("sti");
+                    }
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step in queued" : "Step in busy");
                 }
@@ -1520,11 +1619,18 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
-                    if (DbgIsRunning()) {
-                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (DbgIsRunning()) {
+                            sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                            continue;
+                        }
                     }
-                    bool queued = addStepBatch(1);
+                    bool queued = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        queued = addStepBatch(1);
+                    }
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step over queued" : "Step over busy");
                 }
@@ -1533,9 +1639,12 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
-                    if (DbgIsRunning()) {
-                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (DbgIsRunning()) {
+                            sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                            continue;
+                        }
                     }
                     std::string countStr = queryParams["count"];
                     int count = 0;
@@ -1549,7 +1658,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid count");
                         continue;
                     }
-                    bool started = addStepBatch(count);
+                    bool started = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        started = addStepBatch(count);
+                    }
                     sendHttpResponse(clientSocket, started ? 200 : 409, "text/plain",
                         started ? "Step over batch queued" : "Step over busy");
                 }
@@ -1557,7 +1670,10 @@ void handleClientConnection(SOCKET clientSocket) {
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
-                    stopStepBatch();
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        stopStepBatch();
+                    }
                     sendHttpResponse(clientSocket, 200, "text/plain", "Step batch canceled");
                 }
                 else if (path == "/Debug/StepOut") {
@@ -1565,11 +1681,18 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
-                    if (DbgIsRunning()) {
-                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (DbgIsRunning()) {
+                            sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                            continue;
+                        }
                     }
-                    bool queued = queueDebugStepCommand("rto");
+                    bool queued = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        queued = queueDebugStepCommand("rto");
+                    }
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
                         queued ? "Step out queued" : "Step out busy");
                 }
@@ -1589,7 +1712,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    bool success = Script::Debug::SetBreakpoint(addr);
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Debug::SetBreakpoint(addr);
+                    }
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Breakpoint set successfully" : "Failed to set breakpoint");
                 }
@@ -1609,27 +1736,42 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    bool success = Script::Debug::DeleteBreakpoint(addr);
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Debug::DeleteBreakpoint(addr);
+                    }
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Breakpoint deleted successfully" : "Failed to delete breakpoint");
                 }
                 else if (path == "/Cmdline/Get") {
-                    const DBGFUNCTIONS* dbg = DbgFunctions();
+                    const DBGFUNCTIONS* dbg = nullptr;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        dbg = DbgFunctions();
+                    }
                     if (!dbg || !dbg->GetCmdline) {
                         sendHttpResponse(clientSocket, 500, "text/plain", "GetCmdline not available");
                         continue;
                     }
 
                     size_t size = 0;
-                    bool ok = dbg->GetCmdline(nullptr, &size);
+                    bool ok = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        ok = dbg->GetCmdline(nullptr, &size);
+                    }
                     if (!ok || size == 0) {
                         size = 4096;
                     }
 
                     std::string buffer(size, '\0');
-                    if (!dbg->GetCmdline(buffer.data(), &size)) {
-                        sendHttpResponse(clientSocket, 500, "text/plain", "Failed to get cmdline");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (!dbg->GetCmdline(buffer.data(), &size)) {
+                            sendHttpResponse(clientSocket, 500, "text/plain", "Failed to get cmdline");
+                            continue;
+                        }
                     }
 
                     std::string cmdline = std::string(buffer.c_str());
@@ -1639,7 +1781,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     if (!ensureConfirmed(clientSocket, queryParams, "Cmdline/Set")) {
                         continue;
                     }
-                    const DBGFUNCTIONS* dbg = DbgFunctions();
+                    const DBGFUNCTIONS* dbg = nullptr;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        dbg = DbgFunctions();
+                    }
                     if (!dbg || !dbg->SetCmdline) {
                         sendHttpResponse(clientSocket, 500, "text/plain", "SetCmdline not available");
                         continue;
@@ -1655,7 +1801,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
 
-                    bool success = dbg->SetCmdline(cmdline.c_str());
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = dbg->SetCmdline(cmdline.c_str());
+                    }
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain",
                         success ? "Cmdline set successfully" : "Failed to set cmdline");
                 }
@@ -1680,7 +1830,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     unsigned char dest[16];
                     int size = 16;
-                    bool success = Script::Assembler::Assemble(addr, dest, &size, instruction.c_str());
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Assembler::Assemble(addr, dest, &size, instruction.c_str());
+                    }
                     
                     if (success) {
                         std::stringstream ss;
@@ -1715,7 +1869,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    bool success = Script::Assembler::AssembleMem(addr, instruction.c_str());
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Assembler::AssembleMem(addr, instruction.c_str());
+                    }
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Instruction assembled in memory successfully" : "Failed to assemble instruction in memory");
                 }
@@ -1723,7 +1881,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     if (!ensureConfirmed(clientSocket, queryParams, "Stack/Pop")) {
                         continue;
                     }
-                    duint value = Script::Stack::Pop();
+                    duint value = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        value = Script::Stack::Pop();
+                    }
                     std::stringstream ss;
                     ss << "0x" << std::hex << value;
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
@@ -1744,7 +1906,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    duint prevTop = Script::Stack::Push(value);
+                    duint prevTop = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        prevTop = Script::Stack::Push(value);
+                    }
                     std::stringstream ss;
                     ss << "0x" << std::hex << prevTop;
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
@@ -1761,7 +1927,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         offset = static_cast<int>(parsed);
                     }
                     
-                    duint value = Script::Stack::Peek(offset);
+                    duint value = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        value = Script::Stack::Peek(offset);
+                    }
                     std::stringstream ss;
                     ss << "0x" << std::hex << value;
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
@@ -1781,7 +1951,10 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     // Use the correct DISASM_INSTR structure
                     DISASM_INSTR instr;
-                    DbgDisasmAt(addr, &instr);
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        DbgDisasmAt(addr, &instr);
+                    }
                     
                     // Create JSON response with available instruction details
                     std::stringstream ss;
@@ -1831,7 +2004,10 @@ void handleClientConnection(SOCKET clientSocket) {
                     duint currentAddr = addr;
                     for (int i = 0; i < count; i++) {
                         DISASM_INSTR instr;
-                        DbgDisasmAt(currentAddr, &instr);
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            DbgDisasmAt(currentAddr, &instr);
+                        }
                         
                         if (instr.instr_size > 0) {
                             if (i > 0) ss << ",";
@@ -1852,10 +2028,13 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Disasm/GetInstructionAtRIP") {
-                    duint rip = Script::Register::Get(REG_IP);
-
+                    duint rip = 0;
                     DISASM_INSTR instr;
-                    DbgDisasmAt(rip, &instr);
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        rip = Script::Register::Get(REG_IP);
+                        DbgDisasmAt(rip, &instr);
+                    }
 
                     std::stringstream ss;
                     ss << "{";
@@ -1868,16 +2047,22 @@ void handleClientConnection(SOCKET clientSocket) {
                 }
                 else if (path == "/Disasm/StepInWithDisasm") {
                     cancelRunUntilUserCodeIfActive();
-                    if (DbgIsRunning()) {
-                        sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (DbgIsRunning()) {
+                            sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
+                            continue;
+                        }
                     }
-
-                    duint rip = Script::Register::Get(REG_IP);
+                    duint rip = 0;
                     DISASM_INSTR instr;
-                    DbgDisasmAt(rip, &instr);
-
-                    bool queued = queueDebugStepCommand("sti");
+                    bool queued = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        rip = Script::Register::Get(REG_IP);
+                        DbgDisasmAt(rip, &instr);
+                        queued = queueDebugStepCommand("sti");
+                    }
 
                     std::stringstream ss;
                     ss << "{";
@@ -1900,18 +2085,21 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     bool value = false;
-                    if (flagName == "ZF" || flagName == "zf") value = Script::Flag::GetZF();
-                    else if (flagName == "OF" || flagName == "of") value = Script::Flag::GetOF();
-                    else if (flagName == "CF" || flagName == "cf") value = Script::Flag::GetCF();
-                    else if (flagName == "PF" || flagName == "pf") value = Script::Flag::GetPF();
-                    else if (flagName == "SF" || flagName == "sf") value = Script::Flag::GetSF();
-                    else if (flagName == "TF" || flagName == "tf") value = Script::Flag::GetTF();
-                    else if (flagName == "AF" || flagName == "af") value = Script::Flag::GetAF();
-                    else if (flagName == "DF" || flagName == "df") value = Script::Flag::GetDF();
-                    else if (flagName == "IF" || flagName == "if") value = Script::Flag::GetIF();
-                    else {
-                        sendHttpResponse(clientSocket, 400, "text/plain", "Unknown flag");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (flagName == "ZF" || flagName == "zf") value = Script::Flag::GetZF();
+                        else if (flagName == "OF" || flagName == "of") value = Script::Flag::GetOF();
+                        else if (flagName == "CF" || flagName == "cf") value = Script::Flag::GetCF();
+                        else if (flagName == "PF" || flagName == "pf") value = Script::Flag::GetPF();
+                        else if (flagName == "SF" || flagName == "sf") value = Script::Flag::GetSF();
+                        else if (flagName == "TF" || flagName == "tf") value = Script::Flag::GetTF();
+                        else if (flagName == "AF" || flagName == "af") value = Script::Flag::GetAF();
+                        else if (flagName == "DF" || flagName == "df") value = Script::Flag::GetDF();
+                        else if (flagName == "IF" || flagName == "if") value = Script::Flag::GetIF();
+                        else {
+                            sendHttpResponse(clientSocket, 400, "text/plain", "Unknown flag");
+                            continue;
+                        }
                     }
                     
                     sendHttpResponse(clientSocket, 200, "text/plain", value ? "true" : "false");
@@ -1929,19 +2117,21 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     bool value = (valueStr == "true" || valueStr == "1");
                     bool success = false;
-                    
-                    if (flagName == "ZF" || flagName == "zf") success = Script::Flag::SetZF(value);
-                    else if (flagName == "OF" || flagName == "of") success = Script::Flag::SetOF(value);
-                    else if (flagName == "CF" || flagName == "cf") success = Script::Flag::SetCF(value);
-                    else if (flagName == "PF" || flagName == "pf") success = Script::Flag::SetPF(value);
-                    else if (flagName == "SF" || flagName == "sf") success = Script::Flag::SetSF(value);
-                    else if (flagName == "TF" || flagName == "tf") success = Script::Flag::SetTF(value);
-                    else if (flagName == "AF" || flagName == "af") success = Script::Flag::SetAF(value);
-                    else if (flagName == "DF" || flagName == "df") success = Script::Flag::SetDF(value);
-                    else if (flagName == "IF" || flagName == "if") success = Script::Flag::SetIF(value);
-                    else {
-                        sendHttpResponse(clientSocket, 400, "text/plain", "Unknown flag");
-                        continue;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        if (flagName == "ZF" || flagName == "zf") success = Script::Flag::SetZF(value);
+                        else if (flagName == "OF" || flagName == "of") success = Script::Flag::SetOF(value);
+                        else if (flagName == "CF" || flagName == "cf") success = Script::Flag::SetCF(value);
+                        else if (flagName == "PF" || flagName == "pf") success = Script::Flag::SetPF(value);
+                        else if (flagName == "SF" || flagName == "sf") success = Script::Flag::SetSF(value);
+                        else if (flagName == "TF" || flagName == "tf") success = Script::Flag::SetTF(value);
+                        else if (flagName == "AF" || flagName == "af") success = Script::Flag::SetAF(value);
+                        else if (flagName == "DF" || flagName == "df") success = Script::Flag::SetDF(value);
+                        else if (flagName == "IF" || flagName == "if") success = Script::Flag::SetIF(value);
+                        else {
+                            sendHttpResponse(clientSocket, 400, "text/plain", "Unknown flag");
+                            continue;
+                        }
                     }
                     
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
@@ -1972,7 +2162,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    duint result = Script::Pattern::FindMem(start, size, Pattern.c_str());
+                    duint result = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        result = Script::Pattern::FindMem(start, size, Pattern.c_str());
+                    }
                     if (result != 0) {
                         std::stringstream ss;
                         ss << "0x" << std::hex << result;
@@ -1994,7 +2188,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     
                     duint value = 0;
-                    bool success = Script::Misc::ParseExpression(expression.c_str(), &value);
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Misc::ParseExpression(expression.c_str(), &value);
+                    }
                     
                     if (success) {
                         std::stringstream ss;
@@ -2013,7 +2211,11 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     
-                    duint addr = Script::Misc::RemoteGetProcAddress(module.c_str(), api.c_str());
+                    duint addr = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        addr = Script::Misc::RemoteGetProcAddress(module.c_str(), api.c_str());
+                    }
                     if (addr != 0) {
                         std::stringstream ss;
                         ss << "0x" << std::hex << addr;
@@ -2038,7 +2240,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     
                     // Get the base address and size
                     duint size = 0;
-                    duint baseAddr = DbgMemFindBaseAddr(addr, &size);
+                    duint baseAddr = 0;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        baseAddr = DbgMemFindBaseAddr(addr, &size);
+                    }
                     _plugin_logprintf("Base address found: " FMT_DUINT_HEX ", size: " FMT_DUINT_DEC "\n", DUINT_CAST_PRINTF(baseAddr), DUSIZE_CAST_PRINTF(size));
                     if (baseAddr == 0) {
                         sendHttpResponse(clientSocket, 404, "text/plain", "No module found for this address");
@@ -2055,7 +2261,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     ListInfo moduleList;
                     
                     // Get the list of modules
-                    bool success = Script::Module::GetList(&moduleList);
+                    bool success = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        success = Script::Module::GetList(&moduleList);
+                    }
                     
                     if (!success) {
                         sendHttpResponse(clientSocket, 500, "text/plain", "Failed to get module list");
@@ -2391,23 +2601,27 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
         stopStepBatch();
     }
 
-    duint rip = Script::Register::Get(REG_IP);
-    bool shouldResume = ShouldResumeAfterPause(
-        g_runUntilUserCodeActive.load(),
-        g_runUntilUserCodeAutoResume.load(),
-        g_runUntilUserCodeUserBpHit.load(),
-        isSystemModuleAddr(rip));
+    bool runActive = g_runUntilUserCodeActive.load();
+    bool autoResume = g_runUntilUserCodeAutoResume.load();
+    bool userBpHit = g_runUntilUserCodeUserBpHit.load();
 
-    if (shouldResume) {
-        enqueueDbgTask([] {
+    enqueueDbgTask([runActive, autoResume, userBpHit] {
+        duint rip = Script::Register::Get(REG_IP);
+        bool shouldResume = ShouldResumeAfterPause(
+            runActive,
+            autoResume,
+            userBpHit,
+            isSystemModuleAddr(rip));
+
+        if (shouldResume) {
             DbgCmdExec("run");
-        });
-        return;
-    }
+            return;
+        }
 
-    if (g_runUntilUserCodeActive.load()) {
-        clearRunUntilUserCodeState();
-    }
+        if (runActive) {
+            clearRunUntilUserCodeState();
+        }
+    });
 }
 
 void cbStopDebug(CBTYPE cbType, void* callbackInfo) {

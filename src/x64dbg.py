@@ -551,18 +551,22 @@ def RegisterGet(register: str) -> str:
     return safe_get("Register/Get", {"register": register})
 
 @mcp.tool()
-def RegisterSet(register: str, value: str) -> str:
+def RegisterSet(register: str, value: str, confirm: bool = False) -> str:
     """
     Set register value using Script API
     
     Parameters:
         register: Register name (e.g. "eax", "rax", "rip")
         value: Value to set (in hex format, e.g. "0x1000")
+        confirm: Confirm write when safe mode is enabled
     
     Returns:
         Status message
     """
-    return safe_get("Register/Set", {"register": register, "value": value})
+    params = {"register": register, "value": value}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Register/Set", params)
 
 # =============================================================================
 # MEMORY API (Enhanced)
@@ -583,11 +587,9 @@ def MemoryRead(addr: str, size: str) -> str:
     detailed = safe_get("Memory/ReadDetailed", {"addr": addr, "size": size})
     if isinstance(detailed, dict):
         data = detailed.get("data")
-        if data is None:
-            return detailed
-        if detailed.get("partial"):
-            return detailed
-        return data
+        if data is not None:
+            return data
+        return json.dumps(detailed, ensure_ascii=True)
     if isinstance(detailed, str):
         return detailed
     if isinstance(detailed, int):
@@ -609,18 +611,22 @@ def MemoryReadDetailed(addr: str, size: str) -> Any:
     return safe_get("Memory/ReadDetailed", {"addr": addr, "size": size})
 
 @mcp.tool()
-def MemoryWrite(addr: str, data: str) -> str:
+def MemoryWrite(addr: str, data: str, confirm: bool = False) -> str:
     """
     Write memory using enhanced Script API
     
     Parameters:
         addr: Memory address (in hex format, e.g. "0x1000")
         data: Hexadecimal string representing the data to write
+        confirm: Confirm write when safe mode is enabled
     
     Returns:
         Status message
     """
-    return safe_get("Memory/Write", {"addr": addr, "data": data})
+    params = {"addr": addr, "data": data}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Memory/Write", params)
 
 @mcp.tool()
 def MemoryIsValidPtr(addr: str) -> bool:
@@ -686,14 +692,20 @@ def DebugPause() -> str:
     return safe_get("Debug/Pause")
 
 @mcp.tool()
-def DebugStop() -> str:
+def DebugStop(confirm: bool = False) -> str:
     """
     Stop debugging using Script API
+
+    Parameters:
+        confirm: Confirm stop when safe mode is enabled
     
     Returns:
         Status message
     """
-    return safe_get("Debug/Stop")
+    params = {}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Debug/Stop", params)
 
 @mcp.tool()
 def DebugStepIn() -> str:
@@ -789,16 +801,19 @@ def CmdlineGet() -> str:
     return safe_get("Cmdline/Get")
 
 @mcp.tool()
-def CmdlineSet(cmdline: str) -> str:
+def CmdlineSet(cmdline: str, confirm: bool = False) -> str:
     """
     Set the debuggee command line
 
     Parameters:
         cmdline: Full command line string
+        confirm: Confirm change when safe mode is enabled
 
     Returns:
         Status message
     """
+    if confirm:
+        return safe_get("Cmdline/Set", {"cmdline": cmdline, "confirm": "1"})
     return safe_post("Cmdline/Set", cmdline)
 
 # =============================================================================
@@ -918,45 +933,59 @@ def AssemblerAssemble(addr: str, instruction: str) -> dict:
     return {"error": "Unexpected response format"}
 
 @mcp.tool()
-def AssemblerAssembleMem(addr: str, instruction: str) -> str:
+def AssemblerAssembleMem(addr: str, instruction: str, confirm: bool = False) -> str:
     """
     Assemble instruction directly into memory using Script API
     
     Parameters:
         addr: Memory address (in hex format, e.g. "0x1000")
         instruction: Assembly instruction (e.g. "mov eax, 1")
+        confirm: Confirm write when safe mode is enabled
     
     Returns:
         Status message
     """
-    return safe_get("Assembler/AssembleMem", {"addr": addr, "instruction": instruction})
+    params = {"addr": addr, "instruction": instruction}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Assembler/AssembleMem", params)
 
 # =============================================================================
 # STACK API
 # =============================================================================
 
 @mcp.tool()
-def StackPop() -> str:
+def StackPop(confirm: bool = False) -> str:
     """
     Pop value from stack using Script API
     
+    Parameters:
+        confirm: Confirm pop when safe mode is enabled
+
     Returns:
         Popped value in hex format
     """
-    return safe_get("Stack/Pop")
+    params = {}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Stack/Pop", params)
 
 @mcp.tool()
-def StackPush(value: str) -> str:
+def StackPush(value: str, confirm: bool = False) -> str:
     """
     Push value to stack using Script API
     
     Parameters:
         value: Value to push (in hex format, e.g. "0x1000")
+        confirm: Confirm push when safe mode is enabled
     
     Returns:
         Previous top value in hex format
     """
-    return safe_get("Stack/Push", {"value": value})
+    params = {"value": value}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Stack/Push", params)
 
 @mcp.tool()
 def StackPeek(offset: str = "0") -> str:
@@ -992,18 +1021,22 @@ def FlagGet(flag: str) -> bool:
     return False
 
 @mcp.tool()
-def FlagSet(flag: str, value: bool) -> str:
+def FlagSet(flag: str, value: bool, confirm: bool = False) -> str:
     """
     Set CPU flag value using Script API
     
     Parameters:
         flag: Flag name (ZF, OF, CF, PF, SF, TF, AF, DF, IF)
         value: Flag value (True/False)
+        confirm: Confirm flag change when safe mode is enabled
     
     Returns:
         Status message
     """
-    return safe_get("Flag/Set", {"flag": flag, "value": "true" if value else "false"})
+    params = {"flag": flag, "value": "true" if value else "false"}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Flag/Set", params)
 
 # =============================================================================
 # PATTERN API
