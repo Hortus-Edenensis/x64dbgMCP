@@ -324,7 +324,7 @@ def _block_to_dict(block: Any) -> Dict[str, Any]:
 # =============================================================================
 
 @mcp.tool()
-def ExecCommand(cmd: str, wait: bool = False) -> str:
+def ExecCommand(cmd: str, wait: bool = False, confirm: bool = False) -> str:
     """
     Execute a command in x64dbg and return its output
     
@@ -335,7 +335,10 @@ def ExecCommand(cmd: str, wait: bool = False) -> str:
     Returns:
         Command execution status and output
     """
-    result = safe_get("ExecCommand", {"cmd": cmd, "wait": "1" if wait else "0"})
+    params = {"cmd": cmd, "wait": "1" if wait else "0"}
+    if confirm:
+        params["confirm"] = "1"
+    result = safe_get("ExecCommand", params)
     if not wait:
         return result
     if _is_error_response(result):
@@ -464,7 +467,7 @@ def CommandRun(cmd: str,
         result["rollback_plan"] = result.get("before")
         return result
 
-    output = ExecCommand(cmd=cmd, wait=wait)
+    output = ExecCommand(cmd=cmd, wait=wait, confirm=confirm)
     result["output"] = output
     if _is_error_response(output):
         result["error"] = output
@@ -577,12 +580,19 @@ def MemoryRead(addr: str, size: str) -> str:
     Returns:
         Hexadecimal string representing the memory contents
     """
-    result = safe_get("Memory/Read", {"addr": addr, "size": size})
-    if isinstance(result, str):
-        return result
-    if isinstance(result, int):
-        return f"{result:x}"
-    return str(result)
+    detailed = safe_get("Memory/ReadDetailed", {"addr": addr, "size": size})
+    if isinstance(detailed, dict):
+        data = detailed.get("data")
+        if data is None:
+            return detailed
+        if detailed.get("partial"):
+            return detailed
+        return data
+    if isinstance(detailed, str):
+        return detailed
+    if isinstance(detailed, int):
+        return f"{detailed:x}"
+    return str(detailed)
 
 @mcp.tool()
 def MemoryReadDetailed(addr: str, size: str) -> Any:

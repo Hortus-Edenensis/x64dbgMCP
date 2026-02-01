@@ -88,6 +88,8 @@ static const size_t DEFAULT_MAX_EXEC_OUTPUT = 256 * 1024;
 static const unsigned long long DEFAULT_EXEC_TTL_MS = 5ULL * 60ULL * 1000ULL;
 static const bool DEFAULT_EXEC_REDIRECT = true;
 static const bool DEFAULT_EXEC_DIRECT = true;
+static const bool DEFAULT_SAFE_MODE = false;
+static const size_t DEFAULT_DBG_TASK_QUEUE = 256;
 
 // Global variables
 int g_pluginHandle;
@@ -111,6 +113,8 @@ size_t g_maxExecOutput = DEFAULT_MAX_EXEC_OUTPUT;
 unsigned long long g_execJobTtlMs = DEFAULT_EXEC_TTL_MS;
 bool g_execRedirectEnabled = DEFAULT_EXEC_REDIRECT;
 bool g_execDirectEnabled = DEFAULT_EXEC_DIRECT;
+bool g_safeModeEnabled = DEFAULT_SAFE_MODE;
+size_t g_dbgTaskQueueMax = DEFAULT_DBG_TASK_QUEUE;
 
 struct ExecCommandJob {
     std::string id;
@@ -131,6 +135,12 @@ std::unordered_map<std::string, ExecCommandJob> g_execJobs;
 std::thread g_execWorkerThread;
 std::atomic<bool> g_execWorkerRunning(false);
 std::atomic<unsigned long long> g_execJobCounter(0);
+
+std::mutex g_dbgTaskMutex;
+std::condition_variable g_dbgTaskCv;
+std::queue<std::function<void()>> g_dbgTaskQueue;
+std::thread g_dbgTaskThread;
+std::atomic<bool> g_dbgTaskRunning(false);
 
 // Run-until-user-code state
 std::atomic<bool> g_runUntilUserCodeActive(false);
@@ -328,6 +338,8 @@ static void loadServerConfigFromEnv() {
     g_execJobTtlMs = readSizeEnv("X64DBG_EXEC_TTL_MS", DEFAULT_EXEC_TTL_MS, 10 * 1000, 60ULL * 60ULL * 1000ULL);
     g_execRedirectEnabled = readBoolEnv("X64DBG_EXEC_REDIRECT", DEFAULT_EXEC_REDIRECT);
     g_execDirectEnabled = readBoolEnv("X64DBG_EXEC_DIRECT", DEFAULT_EXEC_DIRECT);
+    g_safeModeEnabled = readBoolEnv("X64DBG_SAFE_MODE", DEFAULT_SAFE_MODE);
+    g_dbgTaskQueueMax = readSizeEnv("X64DBG_DBG_TASK_QUEUE", DEFAULT_DBG_TASK_QUEUE, 32, 2048);
 }
 
 static std::string jsonEscape(const std::string& input) {
@@ -439,6 +451,30 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
 static bool ensureDebugging(SOCKET clientSocket) {
     if (!DbgIsDebugging()) {
         sendHttpResponse(clientSocket, 409, "text/plain", "No active debug session");
+        return false;
+    }
+    return true;
+}
+
+static bool ensureConfirmed(SOCKET clientSocket,
+                            const std::unordered_map<std::string, std::string>& queryParams,
+                            const char* action) {
+    if (!g_safeModeEnabled) {
+        return true;
+    }
+    std::string confirmStr;
+    auto it = queryParams.find("confirm");
+    if (it != queryParams.end()) {
+        confirmStr = it->second;
+    }
+    bool confirmed = ParseBool(confirmStr, false);
+    if (!confirmed) {
+        std::string msg = "Confirmation required";
+        if (action && *action) {
+            msg += " for ";
+            msg += action;
+        }
+        sendHttpResponse(clientSocket, 403, "text/plain", msg);
         return false;
     }
     return true;
@@ -615,6 +651,66 @@ static void stopExecCommandWorker() {
     g_execJobs.clear();
 }
 
+static void dbgTaskWorkerLoop() {
+    while (g_dbgTaskRunning.load()) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(g_dbgTaskMutex);
+            g_dbgTaskCv.wait(lock, [] {
+                return !g_dbgTaskRunning.load() || !g_dbgTaskQueue.empty();
+            });
+            if (!g_dbgTaskRunning.load() && g_dbgTaskQueue.empty()) {
+                return;
+            }
+            if (!g_dbgTaskQueue.empty()) {
+                task = std::move(g_dbgTaskQueue.front());
+                g_dbgTaskQueue.pop();
+            }
+        }
+
+        if (task) {
+            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+            task();
+        }
+    }
+}
+
+static void startDbgTaskWorker() {
+    if (g_dbgTaskRunning.load()) {
+        return;
+    }
+    g_dbgTaskRunning.store(true);
+    g_dbgTaskThread = std::thread(dbgTaskWorkerLoop);
+}
+
+static void stopDbgTaskWorker() {
+    if (!g_dbgTaskRunning.load()) {
+        return;
+    }
+    g_dbgTaskRunning.store(false);
+    g_dbgTaskCv.notify_all();
+    if (g_dbgTaskThread.joinable()) {
+        g_dbgTaskThread.join();
+    }
+    std::lock_guard<std::mutex> lock(g_dbgTaskMutex);
+    while (!g_dbgTaskQueue.empty()) {
+        g_dbgTaskQueue.pop();
+    }
+}
+
+static bool enqueueDbgTask(const std::function<void()>& task) {
+    if (!task) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_dbgTaskMutex);
+    if (g_dbgTaskQueue.size() >= g_dbgTaskQueueMax) {
+        return false;
+    }
+    g_dbgTaskQueue.push(task);
+    g_dbgTaskCv.notify_one();
+    return true;
+}
+
 static void pruneExecJobsLocked(unsigned long long nowMs) {
     if (g_execJobs.empty()) {
         return;
@@ -747,6 +843,7 @@ bool startHttpServer() {
 
     loadServerConfigFromEnv();
     startExecCommandWorker();
+    startDbgTaskWorker();
     
     // Create and start the server thread
     g_httpServerRunning.store(true);
@@ -755,6 +852,7 @@ bool startHttpServer() {
         _plugin_logputs("Failed to create HTTP server thread");
         g_httpServerRunning.store(false);
         stopExecCommandWorker();
+        stopDbgTaskWorker();
         return false;
     }
     
@@ -769,6 +867,7 @@ void stopHttpServer() {
         g_httpServerRunning.store(false);
         g_queueCv.notify_all();
         stopExecCommandWorker();
+        stopDbgTaskWorker();
         
         // Close the server socket to unblock any accept calls
         if (g_serverSocket != INVALID_SOCKET) {
@@ -796,6 +895,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         _plugin_logprintf("WSAStartup failed with error: %d\n", result);
         g_httpServerRunning.store(false);
         stopExecCommandWorker();
+        stopDbgTaskWorker();
         return 1;
     }
     
@@ -806,6 +906,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         WSACleanup();
         g_httpServerRunning.store(false);
         stopExecCommandWorker();
+        stopDbgTaskWorker();
         return 1;
     }
     
@@ -822,6 +923,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         WSACleanup();
         g_httpServerRunning.store(false);
         stopExecCommandWorker();
+        stopDbgTaskWorker();
         return 1;
     }
     
@@ -832,15 +934,18 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         WSACleanup();
         g_httpServerRunning.store(false);
         stopExecCommandWorker();
+        stopDbgTaskWorker();
         return 1;
     }
     
     _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
-    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s exec_direct=%s\n",
+    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s exec_direct=%s safe_mode=%s dbg_task_queue=%zu\n",
                       g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue,
                       g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs,
                       g_execRedirectEnabled ? "true" : "false",
-                      g_execDirectEnabled ? "true" : "false");
+                      g_execDirectEnabled ? "true" : "false",
+                      g_safeModeEnabled ? "true" : "false",
+                      g_dbgTaskQueueMax);
     
     // Start worker threads
     g_workerThreads.clear();
@@ -945,6 +1050,9 @@ void handleClientConnection(SOCKET clientSocket) {
                 }
                 // Unified command execution endpoint
                 if (path == "/ExecCommand") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "ExecCommand")) {
+                        continue;
+                    }
                     std::string cmd = queryParams["cmd"];
                     if (cmd.empty() && !body.empty()) {
                         cmd = body;
@@ -1107,6 +1215,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
                 }
                 else if (path == "/Register/Set") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Register/Set")) {
+                        continue;
+                    }
                     std::string regName = queryParams["register"];
                     std::string valueStr = queryParams["value"];
                     if (regName.empty() || valueStr.empty()) {
@@ -1256,6 +1367,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, partial ? 206 : 200, "application/json", ss.str());
                 }
                 else if (path == "/Memory/Write") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Memory/Write")) {
+                        continue;
+                    }
                     std::string addrStr = queryParams["addr"];
                     std::string dataStr = !body.empty() ? body : queryParams["data"];
                     
@@ -1379,6 +1493,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         submitted ? "Debug pause queued" : "Failed to queue debug pause");
                 }
                 else if (path == "/Debug/Stop") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Debug/Stop")) {
+                        continue;
+                    }
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
@@ -1519,6 +1636,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", cmdline);
                 }
                 else if (path == "/Cmdline/Set") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Cmdline/Set")) {
+                        continue;
+                    }
                     const DBGFUNCTIONS* dbg = DbgFunctions();
                     if (!dbg || !dbg->SetCmdline) {
                         sendHttpResponse(clientSocket, 500, "text/plain", "SetCmdline not available");
@@ -1575,6 +1695,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                 }
                 else if (path == "/Assembler/AssembleMem") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Assembler/AssembleMem")) {
+                        continue;
+                    }
                     std::string addrStr = queryParams["addr"];
                     std::string instruction = queryParams["instruction"];
                     if (instruction.empty() && !body.empty()) {
@@ -1597,12 +1720,18 @@ void handleClientConnection(SOCKET clientSocket) {
                         success ? "Instruction assembled in memory successfully" : "Failed to assemble instruction in memory");
                 }
                 else if (path == "/Stack/Pop") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Stack/Pop")) {
+                        continue;
+                    }
                     duint value = Script::Stack::Pop();
                     std::stringstream ss;
                     ss << "0x" << std::hex << value;
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
                 }
                 else if (path == "/Stack/Push") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Stack/Push")) {
+                        continue;
+                    }
                     std::string valueStr = queryParams["value"];
                     if (valueStr.empty()) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Missing value parameter");
@@ -1788,6 +1917,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", value ? "true" : "false");
                 }
                 else if (path == "/Flag/Set") {
+                    if (!ensureConfirmed(clientSocket, queryParams, "Flag/Set")) {
+                        continue;
+                    }
                     std::string flagName = queryParams["flag"];
                     std::string valueStr = queryParams["value"];
                     if (flagName.empty() || valueStr.empty()) {
@@ -2112,6 +2244,7 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
         case 200: statusText = "OK"; break;
         case 206: statusText = "Partial Content"; break;
         case 400: statusText = "Bad Request"; break;
+        case 403: statusText = "Forbidden"; break;
         case 409: statusText = "Conflict"; break;
         case 413: statusText = "Payload Too Large"; break;
         case 429: statusText = "Too Many Requests"; break;
@@ -2209,7 +2342,9 @@ void cbSystemBreakpoint(CBTYPE cbType, void* callbackInfo) {
     (void)callbackInfo;
 
     if (g_runUntilUserCodeActive.load() && g_runUntilUserCodeAutoResume.load()) {
-        DbgCmdExec("run");
+        enqueueDbgTask([] {
+            DbgCmdExec("run");
+        });
     }
 }
 
@@ -2234,8 +2369,11 @@ void cbBreakpoint(CBTYPE cbType, void* callbackInfo) {
 
     duint addr = info->breakpoint->addr;
     if (g_runUntilUserCodeBp && addr == g_runUntilUserCodeBp) {
+        duint bpAddr = addr;
         if (g_runUntilUserCodeOwnsBp.load()) {
-            Script::Debug::DeleteBreakpoint(addr);
+            enqueueDbgTask([bpAddr] {
+                Script::Debug::DeleteBreakpoint(bpAddr);
+            });
         }
         clearRunUntilUserCodeState();
         return;
@@ -2261,7 +2399,9 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
         isSystemModuleAddr(rip));
 
     if (shouldResume) {
-        DbgCmdExec("run");
+        enqueueDbgTask([] {
+            DbgCmdExec("run");
+        });
         return;
     }
 
@@ -2289,8 +2429,10 @@ void cbStepped(CBTYPE cbType, void* callbackInfo) {
         }
 
         if (remaining > 0) {
-            bool submitted = DbgCmdExec("sto");
-            if (!submitted) {
+            bool queued = enqueueDbgTask([] {
+                DbgCmdExec("sto");
+            });
+            if (!queued) {
                 stopStepBatch();
             }
             return;
