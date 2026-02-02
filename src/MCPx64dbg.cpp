@@ -2116,6 +2116,16 @@ void handleClientConnection(SOCKET clientSocket) {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         running = DbgIsRunning();
                     }
+                    if (running && g_debugStepBusy.load()) {
+                        bool queued = false;
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            queued = addStepBatch(1);
+                        }
+                        sendHttpResponse(clientSocket, queued ? 200 : 409, "text/plain",
+                            queued ? "Step over batch queued" : "Step over busy");
+                        continue;
+                    }
                     if (running) {
                         if (!autoPause) {
                             sendHttpResponse(clientSocket, 409, "text/plain", "Debugger running; pause first");
@@ -2166,6 +2176,28 @@ void handleClientConnection(SOCKET clientSocket) {
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         running = DbgIsRunning();
+                    }
+                    if (running && g_debugStepBusy.load()) {
+                        std::string countStr = queryParams["count"];
+                        int count = 0;
+                        if (!countStr.empty()) {
+                            unsigned long long parsed = 0;
+                            if (parseIntMaybeHex(countStr, parsed)) {
+                                count = static_cast<int>(parsed);
+                            }
+                        }
+                        if (count <= 0) {
+                            sendHttpResponse(clientSocket, 400, "text/plain", "Invalid count");
+                            continue;
+                        }
+                        bool started = false;
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            started = addStepBatch(count);
+                        }
+                        sendHttpResponse(clientSocket, started ? 200 : 409, "text/plain",
+                            started ? "Step over batch queued" : "Step over busy");
+                        continue;
                     }
                     if (running) {
                         if (!autoPause) {
