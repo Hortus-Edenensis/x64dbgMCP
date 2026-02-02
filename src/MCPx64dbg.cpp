@@ -402,6 +402,20 @@ static void stopStepBatch() {
     g_debugStepBusy.store(false);
 }
 
+static void clearDbgTaskQueue() {
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_dbgTaskMutex);
+        dropped = g_dbgTaskQueue.size();
+        while (!g_dbgTaskQueue.empty()) {
+            g_dbgTaskQueue.pop();
+        }
+    }
+    if (dropped > 0) {
+        _plugin_logprintf("Dropped %zu pending debug tasks\n", dropped);
+    }
+}
+
 static bool startStepBatch(int count) {
     if (count <= 0) {
         return false;
@@ -1623,6 +1637,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
                     }
                     clearRunUntilUserCodeState();
+                    clearDbgTaskQueue();
                     sendHttpResponse(clientSocket, 200, "text/plain", "Run-until-user-code canceled");
                 }
                 else if (path == "/Debug/Restart") {
@@ -1642,6 +1657,8 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
                     std::string waitStr = queryParams["wait"];
                     bool wait = ParseBool(waitStr, true);
                     unsigned int timeoutMs = 5000;
@@ -1687,6 +1704,8 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
@@ -1734,6 +1753,8 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
@@ -1781,6 +1802,8 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
@@ -1850,6 +1873,8 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
                     cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
@@ -2243,6 +2268,8 @@ void handleClientConnection(SOCKET clientSocket) {
                 }
                 else if (path == "/Disasm/StepInWithDisasm") {
                     cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
