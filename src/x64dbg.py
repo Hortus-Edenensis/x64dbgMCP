@@ -682,14 +682,22 @@ def DebugRestart() -> str:
     return safe_get("Debug/Restart")
 
 @mcp.tool()
-def DebugPause() -> str:
+def DebugPause(wait: bool = True, timeout_ms: int = 5000) -> str:
     """
     Pause execution of the debugged process using Script API
+
+    Parameters:
+        wait: Wait for pause to complete
+        timeout_ms: Max time to wait for pause (ms)
     
     Returns:
         Status message
     """
-    return safe_get("Debug/Pause")
+    params = {}
+    if wait:
+        params["wait"] = "1"
+        params["timeoutMs"] = str(timeout_ms)
+    return safe_get("Debug/Pause", params)
 
 @mcp.tool()
 def DebugStop(confirm: bool = False) -> str:
@@ -708,37 +716,50 @@ def DebugStop(confirm: bool = False) -> str:
     return safe_get("Debug/Stop", params)
 
 @mcp.tool()
-def DebugStepIn() -> str:
+def DebugStepIn(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
     """
     Step into the next instruction using Script API
     
-    Returns:
-        Status message
-    """
-    return safe_get("Debug/StepIn")
-
-@mcp.tool()
-def DebugStepOver() -> str:
-    """
-    Step over the next instruction using Script API
+    Parameters:
+        auto_pause: Pause automatically if debugger is running
+        timeout_ms: Max time to wait for pause (ms)
     
     Returns:
         Status message
     """
-    return safe_get("Debug/StepOver")
+    params = {"autoPause": "1" if auto_pause else "0", "timeoutMs": str(timeout_ms)}
+    return safe_get("Debug/StepIn", params)
 
 @mcp.tool()
-def DebugStepOverN(count: int) -> str:
+def DebugStepOver(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
+    """
+    Step over the next instruction using Script API
+    
+    Parameters:
+        auto_pause: Pause automatically if debugger is running
+        timeout_ms: Max time to wait for pause (ms)
+    
+    Returns:
+        Status message
+    """
+    params = {"autoPause": "1" if auto_pause else "0", "timeoutMs": str(timeout_ms)}
+    return safe_get("Debug/StepOver", params)
+
+@mcp.tool()
+def DebugStepOverN(count: int, auto_pause: bool = True, timeout_ms: int = 5000) -> str:
     """
     Step over multiple instructions using the debugger command queue
 
     Parameters:
         count: Number of step-over iterations
+        auto_pause: Pause automatically if debugger is running
+        timeout_ms: Max time to wait for pause (ms)
 
     Returns:
         Status message
     """
-    return safe_get("Debug/StepOverN", {"count": str(count)})
+    params = {"count": str(count), "autoPause": "1" if auto_pause else "0", "timeoutMs": str(timeout_ms)}
+    return safe_get("Debug/StepOverN", params)
 
 @mcp.tool()
 def CancelStepBatch() -> str:
@@ -751,14 +772,19 @@ def CancelStepBatch() -> str:
     return safe_get("Debug/CancelStepBatch")
 
 @mcp.tool()
-def DebugStepOut() -> str:
+def DebugStepOut(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
     """
     Step out of the current function using Script API
+    
+    Parameters:
+        auto_pause: Pause automatically if debugger is running
+        timeout_ms: Max time to wait for pause (ms)
     
     Returns:
         Status message
     """
-    return safe_get("Debug/StepOut")
+    params = {"autoPause": "1" if auto_pause else "0", "timeoutMs": str(timeout_ms)}
+    return safe_get("Debug/StepOut", params)
 
 @mcp.tool()
 def DebugSetBreakpoint(addr: str) -> str:
@@ -1171,14 +1197,19 @@ def DisasmGetInstructionAtRIP() -> dict:
     return {"error": "Unexpected response format"}
 
 @mcp.tool()
-def StepInWithDisasm() -> dict:
+def StepInWithDisasm(auto_pause: bool = True, timeout_ms: int = 5000) -> dict:
     """
     Step into the next instruction and return both step result and current instruction disassembly
+
+    Parameters:
+        auto_pause: Pause automatically if debugger is running
+        timeout_ms: Max time to wait for pause (ms)
     
     Returns:
         Dictionary containing step result and current instruction info
     """
-    result = safe_get("Disasm/StepInWithDisasm")
+    params = {"autoPause": "1" if auto_pause else "0", "timeoutMs": str(timeout_ms)}
+    result = safe_get("Disasm/StepInWithDisasm", params)
     if isinstance(result, dict):
         return result
     elif isinstance(result, str):
