@@ -9,7 +9,6 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_X64DBG_SERVER = "http://127.0.0.1:8888/"
-DEFAULT_REQUEST_TIMEOUT_SEC = 30
 
 def _read_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -29,6 +28,7 @@ def _read_float_env(name: str, default: float) -> float:
     except Exception:
         return default
 
+DEFAULT_REQUEST_TIMEOUT_SEC = _read_float_env("X64DBG_HTTP_TIMEOUT_SEC", 60.0)
 DEFAULT_EXEC_WAIT_SEC = _read_int_env("X64DBG_EXEC_WAIT_SEC", 30)
 DEFAULT_EXEC_POLL_SEC = _read_float_env("X64DBG_EXEC_POLL_SEC", 0.2)
 
@@ -682,7 +682,7 @@ def DebugRestart() -> str:
     return safe_get("Debug/Restart")
 
 @mcp.tool()
-def DebugPause(wait: bool = True, timeout_ms: int = 5000) -> str:
+def DebugPause(wait: bool = True, timeout_ms: int = 30000) -> str:
     """
     Pause execution of the debugged process using Script API
 
@@ -716,7 +716,7 @@ def DebugStop(confirm: bool = False) -> str:
     return safe_get("Debug/Stop", params)
 
 @mcp.tool()
-def DebugStepIn(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
+def DebugStepIn(auto_pause: bool = True, timeout_ms: int = 30000) -> str:
     """
     Step into the next instruction using Script API
     
@@ -731,7 +731,7 @@ def DebugStepIn(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
     return safe_get("Debug/StepIn", params)
 
 @mcp.tool()
-def DebugStepOver(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
+def DebugStepOver(auto_pause: bool = True, timeout_ms: int = 30000) -> str:
     """
     Step over the next instruction using Script API
     
@@ -746,7 +746,7 @@ def DebugStepOver(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
     return safe_get("Debug/StepOver", params)
 
 @mcp.tool()
-def DebugStepOverN(count: int, auto_pause: bool = True, timeout_ms: int = 5000) -> str:
+def DebugStepOverN(count: int, auto_pause: bool = True, timeout_ms: int = 30000) -> str:
     """
     Step over multiple instructions using the debugger command queue
 
@@ -772,7 +772,7 @@ def CancelStepBatch() -> str:
     return safe_get("Debug/CancelStepBatch")
 
 @mcp.tool()
-def DebugStepOut(auto_pause: bool = True, timeout_ms: int = 5000) -> str:
+def DebugStepOut(auto_pause: bool = True, timeout_ms: int = 30000) -> str:
     """
     Step out of the current function using Script API
     
@@ -863,11 +863,19 @@ def RunUntilUserCode(max_cycles: int = 50, poll_interval_ms: int = 200, max_wait
     if not IsDebugging():
         return {"error": "Not debugging"}
 
-    native = safe_get("Debug/RunUntilUserCode", {"autoResume": "1" if auto_resume else "0"})
-    if isinstance(native, dict) and native.get("entry"):
+    native = safe_get("Debug/RunUntilUserCode", {
+        "autoResume": "1" if auto_resume else "0",
+        "wait": "1",
+        "timeoutMs": str(max_wait_ms),
+        "pauseFirst": "1",
+    })
+    if isinstance(native, dict):
+        if "status" in native or "already_user" in native:
+            return native
         return {"status": "queued", **native}
-    if isinstance(native, str) and "Unknown endpoint" not in native and "404" not in native:
-        return {"error": native}
+    if isinstance(native, str):
+        if "Unknown endpoint" not in native and "404" not in native:
+            return {"error": native}
 
     system_root = os.getenv("SystemRoot") or os.getenv("WINDIR") or "C:\\Windows"
     last_info: Dict[str, Any] = {}
@@ -1197,7 +1205,7 @@ def DisasmGetInstructionAtRIP() -> dict:
     return {"error": "Unexpected response format"}
 
 @mcp.tool()
-def StepInWithDisasm(auto_pause: bool = True, timeout_ms: int = 5000) -> dict:
+def StepInWithDisasm(auto_pause: bool = True, timeout_ms: int = 30000) -> dict:
     """
     Step into the next instruction and return both step result and current instruction disassembly
 

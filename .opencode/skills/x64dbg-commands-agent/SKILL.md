@@ -16,8 +16,8 @@ Use this skill to turn x64dbg command documentation into concrete MCP workflows.
 2. Decide if the operation is write/destructive; if yes, require pause + confirmation.
 3. Prefer `CommandRun` (Python wrapper) for safe execution with optional snapshots.
 4. For reads, prefer detailed APIs (e.g., `MemoryReadDetailed`) when partial reads matter.
-5. For pause/step: call `DebugPause(wait=true)` and use `DebugStep*` with `auto_pause=true` to avoid “Debugger running” errors.
-6. For run‑to‑user: call `Debug/RunUntilUserCode` or `ExecCommand("RunToUserCode")`; re‑check RIP via `DisasmGetInstructionAtRIP`.
+5. For pause/step: call `DebugPause(wait=true, timeoutMs=30000)` and use `DebugStep*` with `auto_pause=true` to avoid “Debugger running” errors.
+6. For run‑to‑user: call `Debug/RunUntilUserCode(wait=true, timeoutMs=30000, pauseFirst=true)` or `ExecCommand("RunToUserCode")`; re‑check RIP via `DisasmGetInstructionAtRIP`.
 
 ## Safety defaults
 - Pause before writes (register/memory/flags/breakpoints).

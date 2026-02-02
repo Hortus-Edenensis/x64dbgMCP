@@ -38,6 +38,7 @@
 #include <unordered_map>
 #include <sstream>
 #include <mutex>
+#include <chrono>
 #include <thread>
 #include <algorithm>
 #include <memory>
@@ -141,6 +142,14 @@ std::condition_variable g_dbgTaskCv;
 std::queue<std::function<void()>> g_dbgTaskQueue;
 std::thread g_dbgTaskThread;
 std::atomic<bool> g_dbgTaskRunning(false);
+std::mutex g_pauseMutex;
+std::condition_variable g_pauseCv;
+std::atomic<unsigned long long> g_pauseSeq(0);
+std::atomic<unsigned long long> g_pauseRequestSeq(0);
+std::atomic<unsigned long long> g_runSessionId(0);
+std::atomic<unsigned long long> g_manualPauseSessionId(0);
+std::atomic<unsigned long long> g_manualPauseRequestSeq(0);
+std::atomic<bool> g_manualPauseOutstanding(false);
 
 // Run-until-user-code state
 std::atomic<bool> g_runUntilUserCodeActive(false);
@@ -148,9 +157,15 @@ std::atomic<bool> g_runUntilUserCodeUserBpHit(false);
 std::atomic<bool> g_runUntilUserCodeOwnsBp(false);
 std::atomic<bool> g_runUntilUserCodeAutoResume(true);
 duint g_runUntilUserCodeBp = 0;
+std::atomic<bool> g_runUntilUserCodeReusedBp(false);
+std::atomic<bool> g_runUntilUserCodePrevEnabled(false);
 std::atomic<bool> g_debugStepBusy(false);
 std::atomic<bool> g_stepBatchActive(false);
 std::atomic<int> g_stepBatchRemaining(0);
+std::atomic<unsigned long long> g_debugStepLastActivityMs(0);
+std::atomic<unsigned int> g_debugStepTimeoutMs(30000);
+std::thread g_stepWatchdogThread;
+std::atomic<bool> g_stepWatchdogRunning(false);
 
 // Helpers
 static bool isSystemModuleAddr(duint addr) {
@@ -371,17 +386,53 @@ static void clearRunUntilUserCodeState() {
     g_runUntilUserCodeOwnsBp.store(false);
     g_runUntilUserCodeAutoResume.store(true);
     g_runUntilUserCodeBp = 0;
+    g_runUntilUserCodeReusedBp.store(false);
+    g_runUntilUserCodePrevEnabled.store(false);
+}
+
+static void clearManualPauseState() {
+    g_manualPauseOutstanding.store(false);
+    g_manualPauseRequestSeq.store(0);
+    g_manualPauseSessionId.store(0);
+}
+
+static void markManualPauseRequested() {
+    unsigned long long seq = g_pauseRequestSeq.fetch_add(1) + 1;
+    g_manualPauseRequestSeq.store(seq);
+    g_manualPauseSessionId.store(g_runSessionId.load());
+    g_manualPauseOutstanding.store(true);
+}
+
+static void cleanupRunUntilUserCodeBreakpointLocked() {
+    if (!g_runUntilUserCodeBp) {
+        return;
+    }
+    if (g_runUntilUserCodeReusedBp.load()) {
+        if (!g_runUntilUserCodePrevEnabled.load()) {
+            std::stringstream ss;
+            ss << "bd 0x" << std::hex << g_runUntilUserCodeBp;
+            DbgCmdExecDirect(ss.str().c_str());
+        }
+        return;
+    }
+    if (g_runUntilUserCodeOwnsBp.load()) {
+        Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
+    }
+}
+
+static void clearRunUntilUserCodeStateLocked(bool cleanupBp) {
+    if (cleanupBp) {
+        cleanupRunUntilUserCodeBreakpointLocked();
+    }
+    clearRunUntilUserCodeState();
 }
 
 static void cancelRunUntilUserCodeIfActive() {
     if (!g_runUntilUserCodeActive.load()) {
         return;
     }
-    if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
-        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-        Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
-    }
-    clearRunUntilUserCodeState();
+    std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+    clearRunUntilUserCodeStateLocked(true);
 }
 
 static bool queueDebugStepCommand(const char* cmd) {
@@ -392,6 +443,10 @@ static bool queueDebugStepCommand(const char* cmd) {
     bool submitted = DbgCmdExec(cmd);
     if (!submitted) {
         g_debugStepBusy.store(false);
+        g_debugStepLastActivityMs.store(0);
+    }
+    else {
+        g_debugStepLastActivityMs.store(GetTickCount64());
     }
     return submitted;
 }
@@ -400,6 +455,23 @@ static void stopStepBatch() {
     g_stepBatchActive.store(false);
     g_stepBatchRemaining.store(0);
     g_debugStepBusy.store(false);
+    g_debugStepLastActivityMs.store(0);
+}
+
+static bool clearStaleStepBusy(unsigned int timeoutMs) {
+    if (!g_debugStepBusy.load()) {
+        return false;
+    }
+    unsigned long long last = g_debugStepLastActivityMs.load();
+    if (!last) {
+        return false;
+    }
+    unsigned long long now = GetTickCount64();
+    if (now > last && (now - last) > timeoutMs) {
+        stopStepBatch();
+        return true;
+    }
+    return false;
 }
 
 static void clearDbgTaskQueue() {
@@ -431,11 +503,33 @@ static bool startStepBatch(int count) {
         stopStepBatch();
         return false;
     }
+    g_debugStepLastActivityMs.store(GetTickCount64());
     return true;
+}
+
+static bool execPauseCommand() {
+    if (DbgCmdExecDirect("pause")) {
+        return true;
+    }
+    return DbgCmdExec("pause");
+}
+
+static bool execRunCommand() {
+    if (DbgCmdExec("run")) {
+        g_runSessionId.fetch_add(1);
+        return true;
+    }
+    return false;
+}
+
+static void signalPauseEvent() {
+    g_pauseSeq.fetch_add(1);
+    g_pauseCv.notify_all();
 }
 
 static bool waitForDebuggerPause(unsigned int timeoutMs) {
     unsigned long long deadline = GetTickCount64() + timeoutMs;
+    unsigned long long seq = g_pauseSeq.load();
     while (GetTickCount64() < deadline) {
         bool debugging = false;
         bool running = false;
@@ -450,7 +544,20 @@ static bool waitForDebuggerPause(unsigned int timeoutMs) {
         if (!running) {
             return true;
         }
-        Sleep(10);
+
+        unsigned long long now = GetTickCount64();
+        if (now >= deadline) {
+            break;
+        }
+        unsigned long long remaining = deadline - now;
+        unsigned long long waitMs = remaining < 50 ? remaining : 50;
+        {
+            std::unique_lock<std::mutex> lock(g_pauseMutex);
+            g_pauseCv.wait_for(lock, std::chrono::milliseconds(waitMs), [seq] {
+                return g_pauseSeq.load() != seq;
+            });
+        }
+        seq = g_pauseSeq.load();
     }
     return false;
 }
@@ -467,6 +574,9 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
         jsonOut = ss.str();
         return true;
     }
+
+    g_runUntilUserCodeReusedBp.store(false);
+    g_runUntilUserCodePrevEnabled.store(false);
 
     duint target = 0;
     const int maxFrames = 32;
@@ -486,11 +596,38 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
     std::string mode = "command";
 
     if (target) {
-        bpSet = Script::Debug::SetBreakpoint(target);
-        g_runUntilUserCodeBp = target;
-        g_runUntilUserCodeOwnsBp.store(bpSet);
-        mode = "return_bp";
-        submitted = DbgCmdExec("run");
+        bool reused = false;
+        BPXTYPE existing = DbgGetBpxTypeAt(target);
+        if (existing & bp_normal) {
+            const DBGFUNCTIONS* dbg = DbgFunctions();
+            BRIDGEBP bp{};
+            if (dbg && dbg->GetBridgeBp && dbg->GetBridgeBp(bp_normal, target, &bp)) {
+                reused = true;
+                g_runUntilUserCodeBp = target;
+                g_runUntilUserCodeOwnsBp.store(false);
+                g_runUntilUserCodeReusedBp.store(true);
+                g_runUntilUserCodePrevEnabled.store(bp.enabled);
+                bpSet = true;
+                mode = "return_bp_reuse";
+                if (!bp.enabled) {
+                    std::stringstream ss;
+                    ss << "be 0x" << std::hex << target;
+                    DbgCmdExecDirect(ss.str().c_str());
+                }
+            }
+        }
+        if (!reused) {
+            bpSet = Script::Debug::SetBreakpoint(target);
+            if (bpSet) {
+                g_runUntilUserCodeBp = target;
+                g_runUntilUserCodeOwnsBp.store(true);
+            } else {
+                g_runUntilUserCodeBp = 0;
+                g_runUntilUserCodeOwnsBp.store(false);
+            }
+            mode = "return_bp";
+        }
+        submitted = execRunCommand();
     } else {
         g_runUntilUserCodeBp = 0;
         g_runUntilUserCodeOwnsBp.store(false);
@@ -498,11 +635,38 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
         if (!submitted) {
             duint entry = Script::Module::GetMainModuleEntry();
             if (entry) {
-                bpSet = Script::Debug::SetBreakpoint(entry);
-                g_runUntilUserCodeBp = entry;
-                g_runUntilUserCodeOwnsBp.store(bpSet);
-                mode = "entry_bp";
-                submitted = DbgCmdExec("run");
+                bool reused = false;
+                BPXTYPE existing = DbgGetBpxTypeAt(entry);
+                if (existing & bp_normal) {
+                    const DBGFUNCTIONS* dbg = DbgFunctions();
+                    BRIDGEBP bp{};
+                    if (dbg && dbg->GetBridgeBp && dbg->GetBridgeBp(bp_normal, entry, &bp)) {
+                        reused = true;
+                        g_runUntilUserCodeBp = entry;
+                        g_runUntilUserCodeOwnsBp.store(false);
+                        g_runUntilUserCodeReusedBp.store(true);
+                        g_runUntilUserCodePrevEnabled.store(bp.enabled);
+                        bpSet = true;
+                        mode = "entry_bp_reuse";
+                        if (!bp.enabled) {
+                            std::stringstream ss;
+                            ss << "be 0x" << std::hex << entry;
+                            DbgCmdExecDirect(ss.str().c_str());
+                        }
+                    }
+                }
+                if (!reused) {
+                    bpSet = Script::Debug::SetBreakpoint(entry);
+                    if (bpSet) {
+                        g_runUntilUserCodeBp = entry;
+                        g_runUntilUserCodeOwnsBp.store(true);
+                    } else {
+                        g_runUntilUserCodeBp = 0;
+                        g_runUntilUserCodeOwnsBp.store(false);
+                    }
+                    mode = "entry_bp";
+                }
+                submitted = execRunCommand();
             } else {
                 jsonOut = "Failed to resolve main module entry";
                 return false;
@@ -578,10 +742,16 @@ static bool isExecCommandSafeReadOnly(const std::string& cmd) {
     }
     std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
     std::istringstream iss(trimmed);
-    std::string first;
-    iss >> first;
-    if (first.empty()) {
+    std::vector<std::string> tokens;
+    for (std::string token; iss >> token; ) {
+        tokens.push_back(token);
+    }
+    if (tokens.empty()) {
         return false;
+    }
+    const std::string& first = tokens[0];
+    if (first == "bp") {
+        return tokens.size() == 1;
     }
     static const std::unordered_set<std::string> kReadOnly = {
         "help", "?", "eip", "rip", "cip", "csp", "cax", "cbp",
@@ -594,7 +764,7 @@ static bool isExecCommandSafeReadOnly(const std::string& cmd) {
         "memlist", "memmap", "meminfo", "memdump",
         "commentlist", "labelist", "bookmarklist",
         "stack", "threads", "threadlist",
-        "bp", "bplist"
+        "bplist"
     };
     return kReadOnly.find(first) != kReadOnly.end();
 }
@@ -802,6 +972,40 @@ static void startDbgTaskWorker() {
     g_dbgTaskThread = std::thread(dbgTaskWorkerLoop);
 }
 
+static void stepWatchdogLoop() {
+    while (g_stepWatchdogRunning.load()) {
+        if (g_debugStepBusy.load()) {
+            unsigned long long last = g_debugStepLastActivityMs.load();
+            unsigned int timeoutMs = g_debugStepTimeoutMs.load();
+            if (last) {
+                unsigned long long now = GetTickCount64();
+                if (now > last && (now - last) > timeoutMs) {
+                    stopStepBatch();
+                }
+            }
+        }
+        Sleep(50);
+    }
+}
+
+static void startStepWatchdog() {
+    if (g_stepWatchdogRunning.load()) {
+        return;
+    }
+    g_stepWatchdogRunning.store(true);
+    g_stepWatchdogThread = std::thread(stepWatchdogLoop);
+}
+
+static void stopStepWatchdog() {
+    if (!g_stepWatchdogRunning.load()) {
+        return;
+    }
+    g_stepWatchdogRunning.store(false);
+    if (g_stepWatchdogThread.joinable()) {
+        g_stepWatchdogThread.join();
+    }
+}
+
 static void stopDbgTaskWorker() {
     if (!g_dbgTaskRunning.load()) {
         return;
@@ -964,6 +1168,7 @@ bool startHttpServer() {
     loadServerConfigFromEnv();
     startExecCommandWorker();
     startDbgTaskWorker();
+    startStepWatchdog();
     
     // Create and start the server thread
     g_httpServerRunning.store(true);
@@ -973,6 +1178,7 @@ bool startHttpServer() {
         g_httpServerRunning.store(false);
         stopExecCommandWorker();
         stopDbgTaskWorker();
+        stopStepWatchdog();
         return false;
     }
     
@@ -988,6 +1194,7 @@ void stopHttpServer() {
         g_queueCv.notify_all();
         stopExecCommandWorker();
         stopDbgTaskWorker();
+        stopStepWatchdog();
         
         // Close the server socket to unblock any accept calls
         if (g_serverSocket != INVALID_SOCKET) {
@@ -1608,7 +1815,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     bool submitted = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                        submitted = DbgCmdExec("run");
+                        submitted = execRunCommand();
                     }
                     sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
                         submitted ? "Debug run queued" : "Failed to queue debug run");
@@ -1619,6 +1826,45 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                     std::string autoStr = queryParams["autoResume"];
                     bool autoResume = ParseBool(autoStr, true);
+                    std::string waitStr = queryParams["wait"];
+                    bool wait = ParseBool(waitStr, false);
+                    std::string timeoutStr = queryParams["timeoutMs"];
+                    unsigned int timeoutMs = 30000;
+                    if (!timeoutStr.empty()) {
+                        unsigned long long parsed = 0;
+                        if (parseIntMaybeHex(timeoutStr, parsed)) {
+                            timeoutMs = static_cast<unsigned int>(parsed);
+                        }
+                    }
+                    std::string pauseFirstStr = queryParams["pauseFirst"];
+                    bool pauseFirst = ParseBool(pauseFirstStr, true);
+
+                    cancelRunUntilUserCodeIfActive();
+                    stopStepBatch();
+                    clearDbgTaskQueue();
+
+                    if (pauseFirst) {
+                        bool running = false;
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            running = DbgIsRunning();
+                        }
+                        if (running) {
+                            bool submitted = false;
+                            {
+                                std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                                submitted = execPauseCommand();
+                            }
+                            if (!submitted) {
+                                sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
+                                continue;
+                            }
+                            if (!waitForDebuggerPause(timeoutMs)) {
+                                sendHttpResponse(clientSocket, 504, "text/plain", "Pause timed out");
+                                continue;
+                            }
+                        }
+                    }
 
                     std::string jsonOut;
                     bool ok = false;
@@ -1626,17 +1872,98 @@ void handleClientConnection(SOCKET clientSocket) {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         ok = startRunUntilUserCode(jsonOut, autoResume);
                     }
-                    sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", jsonOut);
+                    if (!ok) {
+                        sendHttpResponse(clientSocket, 500, "application/json", jsonOut);
+                        continue;
+                    }
+
+                    if (!wait) {
+                        sendHttpResponse(clientSocket, 200, "application/json", jsonOut);
+                        continue;
+                    }
+
+                    if (jsonOut.find("\"already_user\":true") != std::string::npos) {
+                        sendHttpResponse(clientSocket, 200, "application/json", jsonOut);
+                        continue;
+                    }
+
+                    unsigned long long deadline = GetTickCount64() + timeoutMs;
+                    duint rip = 0;
+                    bool system = true;
+                    bool runActive = true;
+                    bool responded = false;
+                    while (GetTickCount64() < deadline) {
+                        unsigned long long now = GetTickCount64();
+                        unsigned long long remaining = deadline > now ? deadline - now : 0;
+                        if (!waitForDebuggerPause(static_cast<unsigned int>(remaining))) {
+                            break;
+                        }
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            rip = Script::Register::Get(REG_IP);
+                            system = isSystemModuleAddr(rip);
+                        }
+
+                        if (!system) {
+                            std::stringstream ss;
+                            ss << "{";
+                            ss << "\"status\":\"user_code\",";
+                            ss << "\"rip\":\"0x" << std::hex << rip << "\",";
+                            ss << "\"system\":false";
+                            ss << "}";
+                            sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                            responded = true;
+                            break;
+                        }
+
+                        runActive = g_runUntilUserCodeActive.load();
+                        if (!runActive) {
+                            std::stringstream ss;
+                            ss << "{";
+                            ss << "\"status\":\"paused_system\",";
+                            ss << "\"rip\":\"0x" << std::hex << rip << "\",";
+                            ss << "\"system\":true";
+                            ss << "}";
+                            sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                            responded = true;
+                            break;
+                        }
+
+                        bool submitted = false;
+                        {
+                            std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                            submitted = execRunCommand();
+                        }
+                        if (!submitted) {
+                            sendHttpResponse(clientSocket, 500, "text/plain", "Failed to resume debug run");
+                            responded = true;
+                            break;
+                        }
+                    }
+
+                    if (responded) {
+                        cancelRunUntilUserCodeIfActive();
+                        continue;
+                    }
+                    cancelRunUntilUserCodeIfActive();
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"status\":\"timeout\"";
+                    if (rip) {
+                        ss << ",\"rip\":\"0x" << std::hex << rip << "\"";
+                        ss << ",\"system\":" << (system ? "true" : "false");
+                    }
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Debug/CancelRunUntilUserCode") {
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
-                    if (g_runUntilUserCodeBp && g_runUntilUserCodeOwnsBp.load()) {
+                    {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                        Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
+                        clearRunUntilUserCodeStateLocked(true);
                     }
-                    clearRunUntilUserCodeState();
                     clearDbgTaskQueue();
                     sendHttpResponse(clientSocket, 200, "text/plain", "Run-until-user-code canceled");
                 }
@@ -1661,7 +1988,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     clearDbgTaskQueue();
                     std::string waitStr = queryParams["wait"];
                     bool wait = ParseBool(waitStr, true);
-                    unsigned int timeoutMs = 5000;
+                    unsigned int timeoutMs = 30000;
                     std::string timeoutStr = queryParams["timeoutMs"];
                     if (!timeoutStr.empty()) {
                         unsigned long long parsed = 0;
@@ -1669,17 +1996,32 @@ void handleClientConnection(SOCKET clientSocket) {
                             timeoutMs = static_cast<unsigned int>(parsed);
                         }
                     }
+                    bool running = false;
+                    {
+                        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+                        running = DbgIsRunning();
+                    }
+                    if (!running) {
+                        clearManualPauseState();
+                        sendHttpResponse(clientSocket, 200, "text/plain", "Debug already paused");
+                        continue;
+                    }
                     bool submitted = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                        submitted = DbgCmdExec("pause");
+                        markManualPauseRequested();
+                        submitted = execPauseCommand();
                     }
                     if (!submitted) {
+                        clearManualPauseState();
                         sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
                         continue;
                     }
                     if (wait) {
                         bool paused = waitForDebuggerPause(timeoutMs);
+                        if (!paused) {
+                            clearManualPauseState();
+                        }
                         sendHttpResponse(clientSocket, paused ? 200 : 504, "text/plain",
                             paused ? "Debug paused" : "Pause timed out");
                         continue;
@@ -1709,13 +2051,15 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
-                    unsigned int timeoutMs = 5000;
+                    unsigned int timeoutMs = 30000;
                     if (!timeoutStr.empty()) {
                         unsigned long long parsed = 0;
                         if (parseIntMaybeHex(timeoutStr, parsed)) {
                             timeoutMs = static_cast<unsigned int>(parsed);
                         }
                     }
+                    g_debugStepTimeoutMs.store(timeoutMs);
+                    clearStaleStepBusy(timeoutMs);
                     bool running = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
@@ -1729,7 +2073,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         bool submitted = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            submitted = DbgCmdExec("pause");
+                            submitted = execPauseCommand();
                         }
                         if (!submitted) {
                             sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
@@ -1758,13 +2102,15 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
-                    unsigned int timeoutMs = 5000;
+                    unsigned int timeoutMs = 30000;
                     if (!timeoutStr.empty()) {
                         unsigned long long parsed = 0;
                         if (parseIntMaybeHex(timeoutStr, parsed)) {
                             timeoutMs = static_cast<unsigned int>(parsed);
                         }
                     }
+                    g_debugStepTimeoutMs.store(timeoutMs);
+                    clearStaleStepBusy(timeoutMs);
                     bool running = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
@@ -1778,7 +2124,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         bool submitted = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            submitted = DbgCmdExec("pause");
+                            submitted = execPauseCommand();
                         }
                         if (!submitted) {
                             sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
@@ -1807,13 +2153,15 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
-                    unsigned int timeoutMs = 5000;
+                    unsigned int timeoutMs = 30000;
                     if (!timeoutStr.empty()) {
                         unsigned long long parsed = 0;
                         if (parseIntMaybeHex(timeoutStr, parsed)) {
                             timeoutMs = static_cast<unsigned int>(parsed);
                         }
                     }
+                    g_debugStepTimeoutMs.store(timeoutMs);
+                    clearStaleStepBusy(timeoutMs);
                     bool running = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
@@ -1827,7 +2175,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         bool submitted = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            submitted = DbgCmdExec("pause");
+                            submitted = execPauseCommand();
                         }
                         if (!submitted) {
                             sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
@@ -1878,13 +2226,15 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
-                    unsigned int timeoutMs = 5000;
+                    unsigned int timeoutMs = 30000;
                     if (!timeoutStr.empty()) {
                         unsigned long long parsed = 0;
                         if (parseIntMaybeHex(timeoutStr, parsed)) {
                             timeoutMs = static_cast<unsigned int>(parsed);
                         }
                     }
+                    g_debugStepTimeoutMs.store(timeoutMs);
+                    clearStaleStepBusy(timeoutMs);
                     bool running = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
@@ -1898,7 +2248,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         bool submitted = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            submitted = DbgCmdExec("pause");
+                            submitted = execPauseCommand();
                         }
                         if (!submitted) {
                             sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
@@ -2273,13 +2623,15 @@ void handleClientConnection(SOCKET clientSocket) {
                     std::string autoPauseStr = queryParams["autoPause"];
                     bool autoPause = ParseBool(autoPauseStr, true);
                     std::string timeoutStr = queryParams["timeoutMs"];
-                    unsigned int timeoutMs = 5000;
+                    unsigned int timeoutMs = 30000;
                     if (!timeoutStr.empty()) {
                         unsigned long long parsed = 0;
                         if (parseIntMaybeHex(timeoutStr, parsed)) {
                             timeoutMs = static_cast<unsigned int>(parsed);
                         }
                     }
+                    g_debugStepTimeoutMs.store(timeoutMs);
+                    clearStaleStepBusy(timeoutMs);
                     bool running = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
@@ -2293,7 +2645,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         bool submitted = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            submitted = DbgCmdExec("pause");
+                            submitted = execPauseCommand();
                         }
                         if (!submitted) {
                             sendHttpResponse(clientSocket, 500, "text/plain", "Failed to queue debug pause");
@@ -2803,7 +3155,7 @@ void cbSystemBreakpoint(CBTYPE cbType, void* callbackInfo) {
 
     if (g_runUntilUserCodeActive.load() && g_runUntilUserCodeAutoResume.load()) {
         enqueueDbgTask([] {
-            DbgCmdExec("run");
+            execRunCommand();
         });
     }
 }
@@ -2829,13 +3181,9 @@ void cbBreakpoint(CBTYPE cbType, void* callbackInfo) {
 
     duint addr = info->breakpoint->addr;
     if (g_runUntilUserCodeBp && addr == g_runUntilUserCodeBp) {
-        duint bpAddr = addr;
-        if (g_runUntilUserCodeOwnsBp.load()) {
-            enqueueDbgTask([bpAddr] {
-                Script::Debug::DeleteBreakpoint(bpAddr);
-            });
-        }
-        clearRunUntilUserCodeState();
+        enqueueDbgTask([] {
+            clearRunUntilUserCodeStateLocked(true);
+        });
         return;
     }
 
@@ -2847,8 +3195,25 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
     (void)callbackInfo;
 
     g_debugStepBusy.store(false);
+    g_debugStepLastActivityMs.store(0);
     if (g_stepBatchActive.load()) {
         stopStepBatch();
+    }
+
+    bool manualPause = false;
+    if (g_manualPauseOutstanding.exchange(false)) {
+        manualPause = (g_manualPauseSessionId.load() == g_runSessionId.load());
+        clearManualPauseState();
+    }
+    signalPauseEvent();
+
+    if (manualPause) {
+        if (g_runUntilUserCodeActive.load()) {
+            enqueueDbgTask([] {
+                clearRunUntilUserCodeStateLocked(true);
+            });
+        }
+        return;
     }
 
     bool runActive = g_runUntilUserCodeActive.load();
@@ -2864,12 +3229,12 @@ void cbPauseDebug(CBTYPE cbType, void* callbackInfo) {
             isSystemModuleAddr(rip));
 
         if (shouldResume) {
-            DbgCmdExec("run");
+            execRunCommand();
             return;
         }
 
         if (runActive) {
-            clearRunUntilUserCodeState();
+            clearRunUntilUserCodeStateLocked(true);
         }
     });
 }
@@ -2878,8 +3243,13 @@ void cbStopDebug(CBTYPE cbType, void* callbackInfo) {
     (void)cbType;
     (void)callbackInfo;
     g_debugStepBusy.store(false);
+    g_debugStepLastActivityMs.store(0);
+    clearManualPauseState();
     stopStepBatch();
-    clearRunUntilUserCodeState();
+    {
+        std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
+        clearRunUntilUserCodeStateLocked(true);
+    }
 }
 
 void cbStepped(CBTYPE cbType, void* callbackInfo) {
@@ -2898,6 +3268,8 @@ void cbStepped(CBTYPE cbType, void* callbackInfo) {
             });
             if (!queued) {
                 stopStepBatch();
+            } else {
+                g_debugStepLastActivityMs.store(GetTickCount64());
             }
             return;
         }
@@ -2906,4 +3278,5 @@ void cbStepped(CBTYPE cbType, void* callbackInfo) {
     }
 
     g_debugStepBusy.store(false);
+    g_debugStepLastActivityMs.store(0);
 }
