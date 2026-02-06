@@ -107,6 +107,41 @@ def _is_error_response(result: Any) -> bool:
         return lower.startswith("error") or lower.startswith("request failed")
     return False
 
+_EXEC_READ_ONLY_WHITELIST = {
+    "help", "?", "eip", "rip", "cip", "csp", "cax", "cbp",
+    "rtr", "script", "sc", "getcmdline", "getthreadid",
+    "mod", "modinfo", "modbase", "modlist", "modulelist",
+    "sym", "symfind", "symaddr", "symname",
+    "eval", "print", "printf", "dump", "db", "dw", "dd", "dq",
+    "disasm", "dis", "disasmaddr",
+    "ref", "refget", "reffind",
+    "memlist", "memmap", "meminfo", "memdump",
+    "commentlist", "labelist", "bookmarklist",
+    "stack", "threads", "threadlist",
+    "bplist",
+}
+
+def _tokenize_exec_command(cmd: str) -> List[str]:
+    if not cmd:
+        return []
+    return [token.lower() for token in cmd.strip().split() if token]
+
+def classify_exec_command_risk(cmd: str) -> str:
+    tokens = _tokenize_exec_command(cmd)
+    if not tokens:
+        return "dangerous"
+    first = tokens[0]
+    if first == "bp":
+        return "whitelist" if len(tokens) == 1 else "dangerous"
+    if first in _EXEC_READ_ONLY_WHITELIST:
+        return "whitelist"
+    return "dangerous"
+
+def _make_elevation_required_error(cmd: str) -> str:
+    tokens = _tokenize_exec_command(cmd)
+    action = f" '{tokens[0]}'" if tokens else ""
+    return f"Error: Dangerous command{action} requires elevation confirmation. Retry with confirm=True."
+
 def _split_csv(text: str) -> List[str]:
     if not text:
         return []
@@ -232,7 +267,7 @@ def _get_mcp_tools_registry() -> Dict[str, Callable[..., Any]]:
     for name, obj in globals().items():
         if not name or not name[0].isupper():
             continue
-        if callable(obj):
+        if inspect.isfunction(obj) and obj.__module__ == __name__:
             try:
                 # Validate signature to ensure it's a plain function
                 inspect.signature(obj)
@@ -335,6 +370,9 @@ def ExecCommand(cmd: str, wait: bool = False, confirm: bool = False) -> str:
     Returns:
         Command execution status and output
     """
+    if classify_exec_command_risk(cmd) == "dangerous" and not confirm:
+        return _make_elevation_required_error(cmd)
+
     params = {"cmd": cmd, "wait": "1" if wait else "0"}
     if confirm:
         params["confirm"] = "1"
@@ -787,30 +825,38 @@ def DebugStepOut(auto_pause: bool = True, timeout_ms: int = 30000) -> str:
     return safe_get("Debug/StepOut", params)
 
 @mcp.tool()
-def DebugSetBreakpoint(addr: str) -> str:
+def DebugSetBreakpoint(addr: str, confirm: bool = False) -> str:
     """
     Set breakpoint at address using Script API
     
     Parameters:
         addr: Memory address (in hex format, e.g. "0x1000")
+        confirm: Confirm write when elevation is enforced
     
     Returns:
         Status message
     """
-    return safe_get("Debug/SetBreakpoint", {"addr": addr})
+    params = {"addr": addr}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Debug/SetBreakpoint", params)
 
 @mcp.tool()
-def DebugDeleteBreakpoint(addr: str) -> str:
+def DebugDeleteBreakpoint(addr: str, confirm: bool = False) -> str:
     """
     Delete breakpoint at address using Script API
     
     Parameters:
         addr: Memory address (in hex format, e.g. "0x1000")
+        confirm: Confirm write when elevation is enforced
     
     Returns:
         Status message
     """
-    return safe_get("Debug/DeleteBreakpoint", {"addr": addr})
+    params = {"addr": addr}
+    if confirm:
+        params["confirm"] = "1"
+    return safe_get("Debug/DeleteBreakpoint", params)
 
 # =============================================================================
 # CMDLINE API
@@ -1127,20 +1173,19 @@ def MiscRemoteGetProcAddress(module: str, api: str) -> str:
 # =============================================================================
 
 @mcp.tool()
-def SetRegister(name: str, value: str) -> str:
+def SetRegister(name: str, value: str, confirm: bool = False) -> str:
     """
     Set register value using command (legacy compatibility)
     
     Parameters:
         name: Register name (e.g. "eax", "rip")
         value: Value to set (in hex format, e.g. "0x1000")
+        confirm: Confirm write when elevation is enforced
     
     Returns:
         Status message
     """
-    # Construct command to set register
-    cmd = f"r {name}={value}"
-    return ExecCommand(cmd)
+    return RegisterSet(register=name, value=value, confirm=confirm)
 
 
 @mcp.tool()
@@ -1297,20 +1342,16 @@ def main_cli():
     if opts.x64dbg_url:
         set_x64dbg_server_url(opts.x64dbg_url)
 
-    # Map CLI call → actual MCP tool function
-    if opts.tool in globals():
-        func = globals()[opts.tool]
-        if callable(func):
-            try:
-                # Try to unpack args dynamically
-                result = func(*opts.args)
-                print(json.dumps(result, indent=2))
-            except TypeError as e:
-                print(f"Error calling {opts.tool}: {e}")
-        else:
-            print(f"{opts.tool} is not callable")
-    else:
+    registry = _get_mcp_tools_registry()
+    func = registry.get(opts.tool)
+    if func is None:
         print(f"Unknown tool: {opts.tool}")
+        return
+    try:
+        result = func(*opts.args)
+        print(json.dumps(result, indent=2))
+    except TypeError as e:
+        print(f"Error calling {opts.tool}: {e}")
 
 
 def claude_cli():
