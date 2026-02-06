@@ -194,7 +194,7 @@ static bool parseIntMaybeHex(const std::string& text, unsigned long long& valueO
 
 static bool parseAddressMaybeHex(const std::string& text, duint& valueOut) {
     unsigned long long parsed = 0;
-    if (!ParseAddressWithMax(text, static_cast<unsigned long long>(std::numeric_limits<duint>::max()), parsed)) {
+    if (!ParseAddressWithMax(text, static_cast<unsigned long long>((std::numeric_limits<duint>::max)()), parsed)) {
         return false;
     }
     valueOut = static_cast<duint>(parsed);
@@ -2582,11 +2582,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
 
                     DISASM_INSTR instr{};
-                    bool disasmOk = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                        disasmOk = DbgDisasmAt(addr, &instr);
+                        DbgDisasmAt(addr, &instr);
                     }
+                    bool disasmOk = instr.instr_size > 0;
                     if (!disasmOk || instr.instr_size <= 0) {
                         sendHttpResponse(clientSocket, 404, "application/json",
                                          "{\"error\":\"Failed to disassemble address\"}");
@@ -2641,11 +2641,11 @@ void handleClientConnection(SOCKET clientSocket) {
                     int emitted = 0;
                     for (int i = 0; i < count; i++) {
                         DISASM_INSTR instr{};
-                        bool disasmOk = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            disasmOk = DbgDisasmAt(currentAddr, &instr);
+                            DbgDisasmAt(currentAddr, &instr);
                         }
+                        bool disasmOk = instr.instr_size > 0;
 
                         if (!disasmOk || instr.instr_size <= 0) {
                             break;
@@ -2672,12 +2672,12 @@ void handleClientConnection(SOCKET clientSocket) {
                 else if (path == "/Disasm/GetInstructionAtRIP") {
                     duint rip = 0;
                     DISASM_INSTR instr{};
-                    bool disasmOk = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         rip = Script::Register::Get(REG_IP);
-                        disasmOk = DbgDisasmAt(rip, &instr);
+                        DbgDisasmAt(rip, &instr);
                     }
+                    bool disasmOk = instr.instr_size > 0;
                     if (!disasmOk || instr.instr_size <= 0) {
                         std::stringstream err;
                         err << "{\"error\":\"Failed to disassemble RIP\",\"address\":\"0x" << std::hex << rip << "\"}";
@@ -2741,7 +2741,8 @@ void handleClientConnection(SOCKET clientSocket) {
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         rip = Script::Register::Get(REG_IP);
-                        disasmOk = DbgDisasmAt(rip, &instr);
+                        DbgDisasmAt(rip, &instr);
+                        disasmOk = instr.instr_size > 0;
                         queued = queueDebugStepCommand("sti");
                     }
 
