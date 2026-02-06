@@ -49,6 +49,7 @@
 #include <functional>
 #include <condition_variable>
 #include <queue>
+#include <limits>
 // Link with ws2_32.lib
 #pragma comment(lib, "ws2_32.lib")
 
@@ -92,6 +93,12 @@ static const bool DEFAULT_EXEC_DIRECT = true;
 static const bool DEFAULT_SAFE_MODE = false;
 static const size_t DEFAULT_DBG_TASK_QUEUE = 256;
 
+enum class ElevationMode {
+    Off,
+    Warn,
+    Enforce
+};
+
 // Global variables
 int g_pluginHandle;
 HANDLE g_httpServerThread = NULL;
@@ -115,6 +122,7 @@ unsigned long long g_execJobTtlMs = DEFAULT_EXEC_TTL_MS;
 bool g_execRedirectEnabled = DEFAULT_EXEC_REDIRECT;
 bool g_execDirectEnabled = DEFAULT_EXEC_DIRECT;
 bool g_safeModeEnabled = DEFAULT_SAFE_MODE;
+ElevationMode g_elevationMode = ElevationMode::Warn;
 size_t g_dbgTaskQueueMax = DEFAULT_DBG_TASK_QUEUE;
 
 struct ExecCommandJob {
@@ -156,7 +164,7 @@ std::atomic<bool> g_runUntilUserCodeActive(false);
 std::atomic<bool> g_runUntilUserCodeUserBpHit(false);
 std::atomic<bool> g_runUntilUserCodeOwnsBp(false);
 std::atomic<bool> g_runUntilUserCodeAutoResume(true);
-duint g_runUntilUserCodeBp = 0;
+std::atomic<duint> g_runUntilUserCodeBp(0);
 std::atomic<bool> g_runUntilUserCodeReusedBp(false);
 std::atomic<bool> g_runUntilUserCodePrevEnabled(false);
 std::atomic<bool> g_debugStepBusy(false);
@@ -181,32 +189,12 @@ static bool isSystemModuleAddr(duint addr) {
 }
 
 static bool parseIntMaybeHex(const std::string& text, unsigned long long& valueOut) {
-    if (text.empty()) {
-        return false;
-    }
-    int base = 10;
-    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
-        base = 16;
-    } else {
-        for (char c : text) {
-            if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-                base = 16;
-                break;
-            }
-        }
-    }
-    try {
-        size_t idx = 0;
-        valueOut = std::stoull(text, &idx, base);
-        return idx == text.size();
-    } catch (...) {
-        return false;
-    }
+    return ParseUnsignedMaybeHex(text, valueOut);
 }
 
 static bool parseAddressMaybeHex(const std::string& text, duint& valueOut) {
     unsigned long long parsed = 0;
-    if (!parseIntMaybeHex(text, parsed)) {
+    if (!ParseAddressWithMax(text, static_cast<unsigned long long>(std::numeric_limits<duint>::max()), parsed)) {
         return false;
     }
     valueOut = static_cast<duint>(parsed);
@@ -214,29 +202,7 @@ static bool parseAddressMaybeHex(const std::string& text, duint& valueOut) {
 }
 
 static bool sanitizeHexBytes(const std::string& input, std::string& output) {
-    output.clear();
-    output.reserve(input.size());
-    bool sawPrefix = false;
-    for (size_t i = 0; i < input.size(); ++i) {
-        unsigned char c = static_cast<unsigned char>(input[i]);
-        if (std::isspace(c)) {
-            continue;
-        }
-        if (!sawPrefix && output.empty() && c == '0' && i + 1 < input.size() &&
-            (input[i + 1] == 'x' || input[i + 1] == 'X')) {
-            sawPrefix = true;
-            ++i;
-            continue;
-        }
-        if (!std::isxdigit(c)) {
-            return false;
-        }
-        output.push_back(static_cast<char>(c));
-    }
-    if (output.empty()) {
-        return false;
-    }
-    return (output.size() % 2) == 0;
+    return SanitizeHexBytes(input, output);
 }
 
 static bool readMemoryHex(duint addr, duint size, std::string& hexOut, duint& sizeRead, std::string& errorOut) {
@@ -343,6 +309,39 @@ static bool readBoolEnv(const char* name, bool defaultValue) {
     return ParseBool(raw, defaultValue);
 }
 
+static ElevationMode readElevationModeEnv(const char* name, ElevationMode defaultMode) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return defaultMode;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "off") {
+        return ElevationMode::Off;
+    }
+    if (value == "warn") {
+        return ElevationMode::Warn;
+    }
+    if (value == "enforce") {
+        return ElevationMode::Enforce;
+    }
+    return defaultMode;
+}
+
+static const char* elevationModeToString(ElevationMode mode) {
+    switch (mode) {
+    case ElevationMode::Off:
+        return "off";
+    case ElevationMode::Warn:
+        return "warn";
+    case ElevationMode::Enforce:
+        return "enforce";
+    default:
+        return "warn";
+    }
+}
+
 static void loadServerConfigFromEnv() {
     g_workerCount = readIntEnv("X64DBG_HTTP_WORKERS", DEFAULT_WORKER_COUNT, 1, 32);
     g_maxQueueSize = readSizeEnv("X64DBG_HTTP_QUEUE", DEFAULT_MAX_QUEUE_SIZE, 8, 1024);
@@ -354,6 +353,7 @@ static void loadServerConfigFromEnv() {
     g_execRedirectEnabled = readBoolEnv("X64DBG_EXEC_REDIRECT", DEFAULT_EXEC_REDIRECT);
     g_execDirectEnabled = readBoolEnv("X64DBG_EXEC_DIRECT", DEFAULT_EXEC_DIRECT);
     g_safeModeEnabled = readBoolEnv("X64DBG_SAFE_MODE", DEFAULT_SAFE_MODE);
+    g_elevationMode = readElevationModeEnv("X64DBG_ELEVATION_MODE", ElevationMode::Warn);
     g_dbgTaskQueueMax = readSizeEnv("X64DBG_DBG_TASK_QUEUE", DEFAULT_DBG_TASK_QUEUE, 32, 2048);
 }
 
@@ -385,7 +385,7 @@ static void clearRunUntilUserCodeState() {
     g_runUntilUserCodeUserBpHit.store(false);
     g_runUntilUserCodeOwnsBp.store(false);
     g_runUntilUserCodeAutoResume.store(true);
-    g_runUntilUserCodeBp = 0;
+    g_runUntilUserCodeBp.store(0);
     g_runUntilUserCodeReusedBp.store(false);
     g_runUntilUserCodePrevEnabled.store(false);
 }
@@ -404,19 +404,20 @@ static void markManualPauseRequested() {
 }
 
 static void cleanupRunUntilUserCodeBreakpointLocked() {
-    if (!g_runUntilUserCodeBp) {
+    duint bpAddr = g_runUntilUserCodeBp.load();
+    if (!bpAddr) {
         return;
     }
     if (g_runUntilUserCodeReusedBp.load()) {
         if (!g_runUntilUserCodePrevEnabled.load()) {
             std::stringstream ss;
-            ss << "bd 0x" << std::hex << g_runUntilUserCodeBp;
+            ss << "bd 0x" << std::hex << bpAddr;
             DbgCmdExecDirect(ss.str().c_str());
         }
         return;
     }
     if (g_runUntilUserCodeOwnsBp.load()) {
-        Script::Debug::DeleteBreakpoint(g_runUntilUserCodeBp);
+        Script::Debug::DeleteBreakpoint(bpAddr);
     }
 }
 
@@ -603,7 +604,7 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
             BRIDGEBP bp{};
             if (dbg && dbg->GetBridgeBp && dbg->GetBridgeBp(bp_normal, target, &bp)) {
                 reused = true;
-                g_runUntilUserCodeBp = target;
+                g_runUntilUserCodeBp.store(target);
                 g_runUntilUserCodeOwnsBp.store(false);
                 g_runUntilUserCodeReusedBp.store(true);
                 g_runUntilUserCodePrevEnabled.store(bp.enabled);
@@ -619,17 +620,17 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
         if (!reused) {
             bpSet = Script::Debug::SetBreakpoint(target);
             if (bpSet) {
-                g_runUntilUserCodeBp = target;
+                g_runUntilUserCodeBp.store(target);
                 g_runUntilUserCodeOwnsBp.store(true);
             } else {
-                g_runUntilUserCodeBp = 0;
+                g_runUntilUserCodeBp.store(0);
                 g_runUntilUserCodeOwnsBp.store(false);
             }
             mode = "return_bp";
         }
         submitted = execRunCommand();
     } else {
-        g_runUntilUserCodeBp = 0;
+        g_runUntilUserCodeBp.store(0);
         g_runUntilUserCodeOwnsBp.store(false);
         submitted = DbgCmdExec("RunToUserCode");
         if (!submitted) {
@@ -642,7 +643,7 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
                     BRIDGEBP bp{};
                     if (dbg && dbg->GetBridgeBp && dbg->GetBridgeBp(bp_normal, entry, &bp)) {
                         reused = true;
-                        g_runUntilUserCodeBp = entry;
+                        g_runUntilUserCodeBp.store(entry);
                         g_runUntilUserCodeOwnsBp.store(false);
                         g_runUntilUserCodeReusedBp.store(true);
                         g_runUntilUserCodePrevEnabled.store(bp.enabled);
@@ -658,10 +659,10 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
                 if (!reused) {
                     bpSet = Script::Debug::SetBreakpoint(entry);
                     if (bpSet) {
-                        g_runUntilUserCodeBp = entry;
+                        g_runUntilUserCodeBp.store(entry);
                         g_runUntilUserCodeOwnsBp.store(true);
                     } else {
-                        g_runUntilUserCodeBp = 0;
+                        g_runUntilUserCodeBp.store(0);
                         g_runUntilUserCodeOwnsBp.store(false);
                     }
                     mode = "entry_bp";
@@ -683,8 +684,8 @@ static bool startRunUntilUserCode(std::string& jsonOut, bool autoResume) {
     ss << "\"mode\":\"" << mode << "\",";
     if (target) {
         ss << "\"target\":\"0x" << std::hex << target << "\",";
-    } else if (g_runUntilUserCodeBp) {
-        ss << "\"target\":\"0x" << std::hex << g_runUntilUserCodeBp << "\",";
+    } else if (duint bpAddr = g_runUntilUserCodeBp.load()) {
+        ss << "\"target\":\"0x" << std::hex << bpAddr << "\",";
     }
     ss << "\"breakpoint_set\":" << (bpSet ? "true" : "false") << ",";
     ss << "\"run_queued\":" << (submitted ? "true" : "false");
@@ -709,64 +710,50 @@ static bool ensureDebugging(SOCKET clientSocket) {
     return true;
 }
 
-static bool ensureConfirmed(SOCKET clientSocket,
-                            const std::unordered_map<std::string, std::string>& queryParams,
-                            const char* action) {
-    if (!g_safeModeEnabled) {
-        return true;
-    }
+static bool queryHasConfirm(const std::unordered_map<std::string, std::string>& queryParams) {
     std::string confirmStr;
     auto it = queryParams.find("confirm");
     if (it != queryParams.end()) {
         confirmStr = it->second;
     }
-    bool confirmed = ParseBool(confirmStr, false);
-    if (!confirmed) {
-        std::string msg = "Confirmation required";
+    return ParseBool(confirmStr, false);
+}
+
+static bool requiresStrictElevation() {
+    return g_safeModeEnabled || g_elevationMode == ElevationMode::Enforce;
+}
+
+static bool ensureDangerousActionAllowed(SOCKET clientSocket,
+                                         const std::unordered_map<std::string, std::string>& queryParams,
+                                         const char* action,
+                                         bool* warnedOut = nullptr) {
+    if (warnedOut) {
+        *warnedOut = false;
+    }
+    if (queryHasConfirm(queryParams)) {
+        return true;
+    }
+    if (g_elevationMode == ElevationMode::Off && !g_safeModeEnabled) {
+        return true;
+    }
+    if (requiresStrictElevation()) {
+        std::string msg = "Elevation confirmation required";
         if (action && *action) {
             msg += " for ";
             msg += action;
         }
+        msg += ". Retry with confirm=1";
         sendHttpResponse(clientSocket, 403, "text/plain", msg);
         return false;
     }
+    if (g_elevationMode == ElevationMode::Warn) {
+        _plugin_logprintf("Elevation warning: dangerous action '%s' executed without confirm\n",
+                          action && *action ? action : "unknown");
+        if (warnedOut) {
+            *warnedOut = true;
+        }
+    }
     return true;
-}
-
-static bool isExecCommandSafeReadOnly(const std::string& cmd) {
-    std::string trimmed = cmd;
-    trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(),
-                                               [](unsigned char c) { return !std::isspace(c); }));
-    if (trimmed.empty()) {
-        return false;
-    }
-    std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
-    std::istringstream iss(trimmed);
-    std::vector<std::string> tokens;
-    for (std::string token; iss >> token; ) {
-        tokens.push_back(token);
-    }
-    if (tokens.empty()) {
-        return false;
-    }
-    const std::string& first = tokens[0];
-    if (first == "bp") {
-        return tokens.size() == 1;
-    }
-    static const std::unordered_set<std::string> kReadOnly = {
-        "help", "?", "eip", "rip", "cip", "csp", "cax", "cbp",
-        "rtr", "script", "sc", "getcmdline", "getthreadid",
-        "mod", "modinfo", "modbase", "modlist", "modulelist",
-        "sym", "symfind", "symaddr", "symname",
-        "eval", "print", "printf", "dump", "db", "dw", "dd", "dq",
-        "disasm", "dis", "disasmaddr",
-        "ref", "refget", "reffind",
-        "memlist", "memmap", "meminfo", "memdump",
-        "commentlist", "labelist", "bookmarklist",
-        "stack", "threads", "threadlist",
-        "bplist"
-    };
-    return kReadOnly.find(first) != kReadOnly.end();
 }
 
 static std::string makeExecJobId() {
@@ -1156,15 +1143,41 @@ extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT* setupStruct) {
 // HTTP Server Implementation
 //=============================================================================
 
+static void stopBackgroundWorkers() {
+    stopExecCommandWorker();
+    stopDbgTaskWorker();
+    stopStepWatchdog();
+}
+
+static void closeAndClearSocketQueue() {
+    std::queue<SOCKET> pendingSockets;
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        pendingSockets.swap(g_socketQueue);
+    }
+    while (!pendingSockets.empty()) {
+        SOCKET s = pendingSockets.front();
+        pendingSockets.pop();
+        if (s != INVALID_SOCKET) {
+            shutdown(s, SD_BOTH);
+            closesocket(s);
+        }
+    }
+}
+
 // Start the HTTP server
 bool startHttpServer() {
-    std::lock_guard<std::mutex> lock(g_httpMutex);
-    
-    // Stop existing server if running
-    if (g_httpServerRunning.load()) {
+    bool shouldStop = false;
+    {
+        std::lock_guard<std::mutex> lock(g_httpMutex);
+        shouldStop = g_httpServerRunning.load();
+    }
+
+    if (shouldStop) {
         stopHttpServer();
     }
 
+    std::lock_guard<std::mutex> lock(g_httpMutex);
     loadServerConfigFromEnv();
     startExecCommandWorker();
     startDbgTaskWorker();
@@ -1176,9 +1189,7 @@ bool startHttpServer() {
     if (g_httpServerThread == NULL) {
         _plugin_logputs("Failed to create HTTP server thread");
         g_httpServerRunning.store(false);
-        stopExecCommandWorker();
-        stopDbgTaskWorker();
-        stopStepWatchdog();
+        stopBackgroundWorkers();
         return false;
     }
     
@@ -1188,27 +1199,25 @@ bool startHttpServer() {
 // Stop the HTTP server
 void stopHttpServer() {
     std::lock_guard<std::mutex> lock(g_httpMutex);
-    
-    if (g_httpServerRunning.load()) {
-        g_httpServerRunning.store(false);
-        g_queueCv.notify_all();
-        stopExecCommandWorker();
-        stopDbgTaskWorker();
-        stopStepWatchdog();
-        
-        // Close the server socket to unblock any accept calls
-        if (g_serverSocket != INVALID_SOCKET) {
-            shutdown(g_serverSocket, SD_BOTH);
-            closesocket(g_serverSocket);
-            g_serverSocket = INVALID_SOCKET;
-        }
-        
-        // Wait for the thread to exit
-        if (g_httpServerThread != NULL) {
-            WaitForSingleObject(g_httpServerThread, 1000);
-            CloseHandle(g_httpServerThread);
-            g_httpServerThread = NULL;
-        }
+
+    g_httpServerRunning.store(false);
+    g_queueCv.notify_all();
+    stopBackgroundWorkers();
+
+    // Close the server socket to unblock any accept calls
+    if (g_serverSocket != INVALID_SOCKET) {
+        shutdown(g_serverSocket, SD_BOTH);
+        closesocket(g_serverSocket);
+        g_serverSocket = INVALID_SOCKET;
+    }
+
+    closeAndClearSocketQueue();
+
+    // Wait for the thread to exit
+    if (g_httpServerThread != NULL) {
+        WaitForSingleObject(g_httpServerThread, 1000);
+        CloseHandle(g_httpServerThread);
+        g_httpServerThread = NULL;
     }
 }
 
@@ -1221,8 +1230,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     if (result != 0) {
         _plugin_logprintf("WSAStartup failed with error: %d\n", result);
         g_httpServerRunning.store(false);
-        stopExecCommandWorker();
-        stopDbgTaskWorker();
+        stopBackgroundWorkers();
         return 1;
     }
     
@@ -1232,8 +1240,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         _plugin_logprintf("Failed to create socket, error: %d\n", WSAGetLastError());
         WSACleanup();
         g_httpServerRunning.store(false);
-        stopExecCommandWorker();
-        stopDbgTaskWorker();
+        stopBackgroundWorkers();
         return 1;
     }
     
@@ -1247,10 +1254,10 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     if (bind(g_serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
         _plugin_logprintf("Bind failed with error: %d\n", WSAGetLastError());
         closesocket(g_serverSocket);
+        g_serverSocket = INVALID_SOCKET;
         WSACleanup();
         g_httpServerRunning.store(false);
-        stopExecCommandWorker();
-        stopDbgTaskWorker();
+        stopBackgroundWorkers();
         return 1;
     }
     
@@ -1258,20 +1265,21 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     if (listen(g_serverSocket, SOMAXCONN) == SOCKET_ERROR) {
         _plugin_logprintf("Listen failed with error: %d\n", WSAGetLastError());
         closesocket(g_serverSocket);
+        g_serverSocket = INVALID_SOCKET;
         WSACleanup();
         g_httpServerRunning.store(false);
-        stopExecCommandWorker();
-        stopDbgTaskWorker();
+        stopBackgroundWorkers();
         return 1;
     }
     
     _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
-    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s exec_direct=%s safe_mode=%s dbg_task_queue=%zu\n",
+    _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s exec_direct=%s safe_mode=%s elevation_mode=%s dbg_task_queue=%zu\n",
                       g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue,
                       g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs,
                       g_execRedirectEnabled ? "true" : "false",
                       g_execDirectEnabled ? "true" : "false",
                       g_safeModeEnabled ? "true" : "false",
+                      elevationModeToString(g_elevationMode),
                       g_dbgTaskQueueMax);
     
     // Start worker threads
@@ -1320,6 +1328,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         }
     }
     g_workerThreads.clear();
+    closeAndClearSocketQueue();
 
     WSACleanup();
     return 0;
@@ -1386,14 +1395,17 @@ void handleClientConnection(SOCKET clientSocket) {
                         continue;
                     }
 
-                    if (g_safeModeEnabled && !isExecCommandSafeReadOnly(cmd)) {
-                        if (!ensureConfirmed(clientSocket, queryParams, "ExecCommand")) {
+                    const CommandRisk cmdRisk = ClassifyExecCommandRisk(cmd);
+                    bool elevationWarned = false;
+                    if (cmdRisk == CommandRisk::Dangerous) {
+                        if (!ensureDangerousActionAllowed(clientSocket, queryParams, "ExecCommand", &elevationWarned)) {
                             continue;
                         }
                     }
 
                     std::string cmdLower = cmd;
-                    std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
+                    std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                     if (cmdLower == "runtousercode" || cmdLower == "runuser" || cmdLower == "runto user code") {
                         std::string jsonOut;
                         bool ok = false;
@@ -1411,8 +1423,11 @@ void handleClientConnection(SOCKET clientSocket) {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                             submitted = DbgCmdExec(cmd.c_str());
                         }
-                        sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain",
-                            submitted ? "Command queued" : "Failed to queue command");
+                        std::string responseMsg = submitted ? "Command queued" : "Failed to queue command";
+                        if (submitted && elevationWarned) {
+                            responseMsg = "Warning: dangerous command executed without confirm in warn mode. " + responseMsg;
+                        }
+                        sendHttpResponse(clientSocket, submitted ? 200 : 500, "text/plain", responseMsg);
                         continue;
                     }
 
@@ -1429,6 +1444,9 @@ void handleClientConnection(SOCKET clientSocket) {
                     ss << "{";
                     ss << "\"job_id\":\"" << jsonEscape(jobId) << "\",";
                     ss << "\"queued\":true";
+                    if (elevationWarned) {
+                        ss << ",\"warning\":\"" << jsonEscape("dangerous command executed without confirm in warn mode") << "\"";
+                    }
                     ss << "}";
                     sendHttpResponse(clientSocket, 202, "application/json", ss.str());
                 }
@@ -1555,7 +1573,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
                 }
                 else if (path == "/Register/Set") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Register/Set")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Register/Set")) {
                         continue;
                     }
                     std::string regName = queryParams["register"];
@@ -1717,7 +1735,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, partial ? 206 : 200, "application/json", ss.str());
                 }
                 else if (path == "/Memory/Write") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Memory/Write")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Memory/Write")) {
                         continue;
                     }
                     std::string addrStr = queryParams["addr"];
@@ -1742,15 +1760,20 @@ void handleClientConnection(SOCKET clientSocket) {
 
                     std::vector<unsigned char> buffer;
                     buffer.reserve(cleaned.size() / 2);
+                    bool parseError = false;
                     for (size_t i = 0; i < cleaned.length(); i += 2) {
                         std::string byteString = cleaned.substr(i, 2);
                         try {
                             unsigned char byte = (unsigned char)std::stoi(byteString, nullptr, 16);
                             buffer.push_back(byte);
-                        } catch (const std::exception& e) {
-                            sendHttpResponse(clientSocket, 400, "text/plain", "Invalid data format");
-                            continue;
+                        } catch (const std::exception&) {
+                            parseError = true;
+                            break;
                         }
+                    }
+                    if (parseError) {
+                        sendHttpResponse(clientSocket, 400, "text/plain", "Invalid data format");
+                        continue;
                     }
                     
                     duint sizeWritten = 0;
@@ -2029,7 +2052,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", "Debug pause queued");
                 }
                 else if (path == "/Debug/Stop") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Debug/Stop")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Debug/Stop")) {
                         continue;
                     }
                     if (!ensureDebugging(clientSocket)) {
@@ -2300,6 +2323,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         queued ? "Step out queued" : "Step out busy");
                 }
                 else if (path == "/Debug/SetBreakpoint") {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Debug/SetBreakpoint")) {
+                        continue;
+                    }
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
@@ -2324,6 +2350,9 @@ void handleClientConnection(SOCKET clientSocket) {
                         success ? "Breakpoint set successfully" : "Failed to set breakpoint");
                 }
                 else if (path == "/Debug/DeleteBreakpoint") {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Debug/DeleteBreakpoint")) {
+                        continue;
+                    }
                     if (!ensureDebugging(clientSocket)) {
                         continue;
                     }
@@ -2381,7 +2410,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", cmdline);
                 }
                 else if (path == "/Cmdline/Set") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Cmdline/Set")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Cmdline/Set")) {
                         continue;
                     }
                     const DBGFUNCTIONS* dbg = nullptr;
@@ -2452,7 +2481,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     }
                 }
                 else if (path == "/Assembler/AssembleMem") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Assembler/AssembleMem")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Assembler/AssembleMem")) {
                         continue;
                     }
                     std::string addrStr = queryParams["addr"];
@@ -2481,7 +2510,7 @@ void handleClientConnection(SOCKET clientSocket) {
                         success ? "Instruction assembled in memory successfully" : "Failed to assemble instruction in memory");
                 }
                 else if (path == "/Stack/Pop") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Stack/Pop")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Stack/Pop")) {
                         continue;
                     }
                     duint value = 0;
@@ -2494,7 +2523,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", ss.str());
                 }
                 else if (path == "/Stack/Push") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Stack/Push")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Stack/Push")) {
                         continue;
                     }
                     std::string valueStr = queryParams["value"];
@@ -2551,22 +2580,26 @@ void handleClientConnection(SOCKET clientSocket) {
                         sendHttpResponse(clientSocket, 400, "text/plain", "Invalid address format");
                         continue;
                     }
-                    
-                    // Use the correct DISASM_INSTR structure
-                    DISASM_INSTR instr;
+
+                    DISASM_INSTR instr{};
+                    bool disasmOk = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                        DbgDisasmAt(addr, &instr);
+                        disasmOk = DbgDisasmAt(addr, &instr);
                     }
-                    
-                    // Create JSON response with available instruction details
+                    if (!disasmOk || instr.instr_size <= 0) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                                         "{\"error\":\"Failed to disassemble address\"}");
+                        continue;
+                    }
+
                     std::stringstream ss;
                     ss << "{";
                     ss << "\"address\":\"0x" << std::hex << addr << "\",";
-                    ss << "\"instruction\":\"" << instr.instruction << "\",";
+                    ss << "\"instruction\":\"" << jsonEscape(instr.instruction) << "\",";
                     ss << "\"size\":" << std::dec << instr.instr_size;
                     ss << "}";
-                    
+
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Disasm/GetInstructionRange") {
@@ -2605,44 +2638,57 @@ void handleClientConnection(SOCKET clientSocket) {
                     ss << "[";
                     
                     duint currentAddr = addr;
+                    int emitted = 0;
                     for (int i = 0; i < count; i++) {
-                        DISASM_INSTR instr;
+                        DISASM_INSTR instr{};
+                        bool disasmOk = false;
                         {
                             std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
-                            DbgDisasmAt(currentAddr, &instr);
+                            disasmOk = DbgDisasmAt(currentAddr, &instr);
                         }
-                        
-                        if (instr.instr_size > 0) {
-                            if (i > 0) ss << ",";
-                            
-                            ss << "{";
-                            ss << "\"address\":\"0x" << std::hex << currentAddr << "\",";
-                            ss << "\"instruction\":\"" << instr.instruction << "\",";
-                            ss << "\"size\":" << std::dec << instr.instr_size;
-                            ss << "}";
-                            
-                            currentAddr += instr.instr_size;
-                        } else {
+
+                        if (!disasmOk || instr.instr_size <= 0) {
                             break;
                         }
+                        if (emitted > 0) {
+                            ss << ",";
+                        }
+                        ss << "{";
+                        ss << "\"address\":\"0x" << std::hex << currentAddr << "\",";
+                        ss << "\"instruction\":\"" << jsonEscape(instr.instruction) << "\",";
+                        ss << "\"size\":" << std::dec << instr.instr_size;
+                        ss << "}";
+                        currentAddr += instr.instr_size;
+                        ++emitted;
                     }
-                    
+                    if (emitted == 0) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                                         "{\"error\":\"Failed to disassemble address range\"}");
+                        continue;
+                    }
                     ss << "]";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Disasm/GetInstructionAtRIP") {
                     duint rip = 0;
-                    DISASM_INSTR instr;
+                    DISASM_INSTR instr{};
+                    bool disasmOk = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         rip = Script::Register::Get(REG_IP);
-                        DbgDisasmAt(rip, &instr);
+                        disasmOk = DbgDisasmAt(rip, &instr);
+                    }
+                    if (!disasmOk || instr.instr_size <= 0) {
+                        std::stringstream err;
+                        err << "{\"error\":\"Failed to disassemble RIP\",\"address\":\"0x" << std::hex << rip << "\"}";
+                        sendHttpResponse(clientSocket, 404, "application/json", err.str());
+                        continue;
                     }
 
                     std::stringstream ss;
                     ss << "{";
                     ss << "\"address\":\"0x" << std::hex << rip << "\",";
-                    ss << "\"instruction\":\"" << instr.instruction << "\",";
+                    ss << "\"instruction\":\"" << jsonEscape(instr.instruction) << "\",";
                     ss << "\"size\":" << std::dec << instr.instr_size;
                     ss << "}";
 
@@ -2689,12 +2735,13 @@ void handleClientConnection(SOCKET clientSocket) {
                         }
                     }
                     duint rip = 0;
-                    DISASM_INSTR instr;
+                    DISASM_INSTR instr{};
+                    bool disasmOk = false;
                     bool queued = false;
                     {
                         std::lock_guard<std::mutex> dbgLock(g_dbgApiMutex);
                         rip = Script::Register::Get(REG_IP);
-                        DbgDisasmAt(rip, &instr);
+                        disasmOk = DbgDisasmAt(rip, &instr);
                         queued = queueDebugStepCommand("sti");
                     }
 
@@ -2702,8 +2749,10 @@ void handleClientConnection(SOCKET clientSocket) {
                     ss << "{";
                     ss << "\"queued\":" << (queued ? "true" : "false") << ",";
                     ss << "\"rip_before\":\"0x" << std::hex << rip << "\",";
-                    ss << "\"instruction_before\":\"" << instr.instruction << "\",";
-                    ss << "\"size\":" << std::dec << instr.instr_size;
+                    ss << "\"disasm_ok\":" << (disasmOk && instr.instr_size > 0 ? "true" : "false") << ",";
+                    ss << "\"instruction_before\":\""
+                       << (disasmOk && instr.instr_size > 0 ? jsonEscape(instr.instruction) : std::string()) << "\",";
+                    ss << "\"size\":" << std::dec << (disasmOk && instr.instr_size > 0 ? instr.instr_size : 0);
                     ss << "}";
 
                     sendHttpResponse(clientSocket, queued ? 200 : 409, "application/json", ss.str());
@@ -2739,7 +2788,7 @@ void handleClientConnection(SOCKET clientSocket) {
                     sendHttpResponse(clientSocket, 200, "text/plain", value ? "true" : "false");
                 }
                 else if (path == "/Flag/Set") {
-                    if (!ensureConfirmed(clientSocket, queryParams, "Flag/Set")) {
+                    if (!ensureDangerousActionAllowed(clientSocket, queryParams, "Flag/Set")) {
                         continue;
                     }
                     std::string flagName = queryParams["flag"];
@@ -2918,12 +2967,12 @@ void handleClientConnection(SOCKET clientSocket) {
                             
                             // Add module info as JSON object
                             jsonResponse << "{";
-                            jsonResponse << "\"name\":\"" << modules[i].name << "\",";
+                            jsonResponse << "\"name\":\"" << jsonEscape(modules[i].name) << "\",";
                             jsonResponse << "\"base\":\"0x" << std::hex << modules[i].base << "\",";
                             jsonResponse << "\"size\":\"0x" << std::hex << modules[i].size << "\",";
                             jsonResponse << "\"entry\":\"0x" << std::hex << modules[i].entry << "\",";
                             jsonResponse << "\"sectionCount\":" << std::dec << modules[i].sectionCount << ",";
-                            jsonResponse << "\"path\":\"" << modules[i].path << "\"";
+                            jsonResponse << "\"path\":\"" << jsonEscape(modules[i].path) << "\"";
                             jsonResponse << "}";
                         }
                         
@@ -2987,7 +3036,8 @@ std::string readHttpRequest(SOCKET clientSocket, bool* tooLarge) {
                 headersDone = true;
                 std::string headers = request.substr(0, headerEndPos);
                 std::string headersLower = headers;
-                std::transform(headersLower.begin(), headersLower.end(), headersLower.begin(), ::tolower);
+                std::transform(headersLower.begin(), headersLower.end(), headersLower.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
                 size_t pos = headersLower.find("content-length:");
                 if (pos != std::string::npos) {
@@ -3086,6 +3136,7 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
     std::string statusText;
     switch (statusCode) {
         case 200: statusText = "OK"; break;
+        case 202: statusText = "Accepted"; break;
         case 206: statusText = "Partial Content"; break;
         case 400: statusText = "Bad Request"; break;
         case 403: statusText = "Forbidden"; break;
@@ -3094,6 +3145,7 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
         case 429: statusText = "Too Many Requests"; break;
         case 404: statusText = "Not Found"; break;
         case 503: statusText = "Service Unavailable"; break;
+        case 504: statusText = "Gateway Timeout"; break;
         case 500: statusText = "Internal Server Error"; break;
         default: statusText = "Unknown";
     }
@@ -3109,7 +3161,16 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
     
     // Send the response
     std::string responseStr = response.str();
-    send(clientSocket, responseStr.c_str(), (int)responseStr.length(), 0);
+    const char* data = responseStr.c_str();
+    size_t total = responseStr.size();
+    size_t sentTotal = 0;
+    while (sentTotal < total) {
+        int sent = send(clientSocket, data + sentTotal, static_cast<int>(total - sentTotal), 0);
+        if (sent <= 0) {
+            break;
+        }
+        sentTotal += static_cast<size_t>(sent);
+    }
 }
 
 
@@ -3212,7 +3273,8 @@ void cbBreakpoint(CBTYPE cbType, void* callbackInfo) {
     }
 
     duint addr = info->breakpoint->addr;
-    if (g_runUntilUserCodeBp && addr == g_runUntilUserCodeBp) {
+    duint trackedBp = g_runUntilUserCodeBp.load();
+    if (trackedBp && addr == trackedBp) {
         enqueueDbgTask([] {
             clearRunUntilUserCodeStateLocked(true);
         });
