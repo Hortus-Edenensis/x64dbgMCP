@@ -1247,7 +1247,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     // Setup the server address structure
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // localhost only
+    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     serverAddr.sin_port = htons((u_short)g_httpPort);
     
     // Bind the socket
@@ -1272,7 +1272,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
         return 1;
     }
     
-    _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
+    _plugin_logprintf("HTTP server started at http://0.0.0.0:%d/\n", g_httpPort);
     _plugin_logprintf("HTTP server config: workers=%d queue=%zu max_request=%zu exec_queue=%zu exec_jobs=%zu exec_output=%zu exec_ttl_ms=%llu exec_redirect=%s exec_direct=%s safe_mode=%s elevation_mode=%s dbg_task_queue=%zu\n",
                       g_workerCount, g_maxQueueSize, g_maxRequestSize, g_maxExecQueue,
                       g_maxExecJobs, g_maxExecOutput, g_execJobTtlMs,
